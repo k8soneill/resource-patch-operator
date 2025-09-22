@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - narada.io.github.k8soneill
+  resources:
+  - patchtrackers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - narada.io.github.k8soneill
+  resources:
+  - patchtrackers/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - narada.io.github.k8soneill
+  resources:
+  - patchtrackers/status
+  verbs:
+  - get
+  - patch
+  - update

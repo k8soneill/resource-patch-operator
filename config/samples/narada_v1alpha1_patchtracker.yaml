@@ -1,0 +1,9 @@
+apiVersion: narada.io.github.k8soneill/v1alpha1
+kind: PatchTracker
+metadata:
+  labels:
+    app.kubernetes.io/name: narada-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: patchtracker-sample
+spec:
+  # TODO(user): Add fields here
