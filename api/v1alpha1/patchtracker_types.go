@@ -23,70 +23,64 @@ import (
 // PatchTrackerSpec defines the desired state of PatchTracker.
 type PatchTrackerSpec struct {
 	// Targets selects one or more resources (built-in or custom) to observe.
-	Targets []TargetRef `json:"targets,omitempty"`
-
-	// Fields defines which fields on the target resources should be observed.
-	// JSONPath or JSONPointer expressions are allowed.
-	Fields []FieldSelector `json:"fields,omitempty"`
-
-	// SecretDeps lists Secrets which, when changed, should trigger reconciles.
-	SecretDeps []SecretRef `json:"secretDeps,omitempty"`
+	// +kubebuilder:validation:Required
+	Targets []TargetRef `json:"targets"`
 
 	// Reconcile controls when reconciles are triggered and timing options.
 	Reconcile ReconcileOptions `json:"reconcile,omitempty"`
 
 	// PatchStrategy determines how the controller will apply changes when acting.
 	// Allowed values: "none", "jsonPatch", "strategicMerge", "serverSideApply".
+	// +default:value="strategicMerge"
 	PatchStrategy string `json:"patchStrategy,omitempty"`
 
 	// ServiceAccountName is an optional hint for RBAC (which SA will be used to read targets).
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
 	// IgnoreMissingTarget controls whether a missing target resource is treated as an error.
+	// +default:value=true
 	IgnoreMissingTarget bool `json:"ignoreMissingTarget,omitempty"`
 }
 
 // TargetRef identifies one or more Kubernetes objects to observe.
 type TargetRef struct {
-	APIVersion string `json:"apiVersion,omitempty"`
-	Kind       string `json:"kind,omitempty"`
+	// +kubebuilder:validation:Required
+	APIVersion string `json:"apiVersion"`
+	// +kubebuilder:validation:Required
+	Kind string `json:"kind"`
 	// If Name is empty and LabelSelector is set, the selector is used to match multiple objects.
-	Name          string                `json:"name,omitempty"`
-	Namespace     string                `json:"namespace,omitempty"`
+	Name string `json:"name,omitempty"`
+	// +kubebuilder:validation:Required
+	Namespace     string                `json:"namespace"`
 	LabelSelector *metav1.LabelSelector `json:"labelSelector,omitempty"`
-	// AllowCrossNamespace permits observing objects in other namespaces when true.
-	AllowCrossNamespace bool `json:"allowCrossNamespace,omitempty"`
+	// +kubebuilder:validation:Required
+	PatchField PatchField `json:"patchField"`
+	// +kubebuilder:validation:Required
+	SecretDeps []SecretRef `json:"secretDeps"`
 }
 
-// FieldSelector describes a single field to observe on the target resource.
-type FieldSelector struct {
-	// Path is a JSONPath or JSONPointer expression for the field to observe (e.g. "$.spec.replicas").
+// PatchField describes a single field to patch on the target resource
+type PatchField struct {
+	// Path is the string path to the field to patch (e.g. "spec.replicas").
+	// +kubebuilder:validation:Required
 	Path string `json:"path"`
-	// MatchType controls how changes are evaluated: "exists", "equals", "regex", "changed".
-	MatchType string `json:"matchType,omitempty"`
-	// Value is used with "equals" or "regex" match types.
-	Value string `json:"value,omitempty"`
-	// Watch indicates whether changes to this field should trigger reconciliation.
-	Watch bool `json:"watch,omitempty"`
 }
 
 // SecretRef identifies Secret dependencies which can trigger reconciles.
 type SecretRef struct {
-	Name          string                `json:"name,omitempty"`
-	Namespace     string                `json:"namespace,omitempty"`
+	Name string `json:"name,omitempty"`
+	// +kubebuilder:validation:Required
+	Namespace     string                `json:"namespace"`
 	LabelSelector *metav1.LabelSelector `json:"labelSelector,omitempty"`
-	// Keys limits watching to specific keys in the Secret; empty means watch whole Secret.
-	Keys []string `json:"keys,omitempty"`
 	// Optional indicates the Secret may be absent without causing an error.
 	Optional bool `json:"optional,omitempty"`
 	// Watch controls whether changes to the Secret trigger reconciles (default true).
+	// +default:value=true
 	Watch bool `json:"watch,omitempty"`
 }
 
 // ReconcileOptions configures trigger types and timing for reconciles.
 type ReconcileOptions struct {
-	// On is a list of triggers to reconcile on: e.g. ["fieldChange","secretChange","anyChange"].
-	On []string `json:"on,omitempty"`
 	// RequeueAfter will requeue reconcile after the given duration if set.
 	RequeueAfter *metav1.Duration `json:"requeueAfter,omitempty"`
 	// Debounce coalesces rapid events occurring within this duration.
