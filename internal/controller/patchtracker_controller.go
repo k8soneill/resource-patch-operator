@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	naradav1alpha1 "github.com/k8soneill/narada-operator/api/v1alpha1"
@@ -47,9 +48,44 @@ type PatchTrackerReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
 func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	// Setup logger object
+	logger := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	// Fetch patchTracker instance
+	patchTracker := &naradav1alpha1.PatchTracker{}
+	if err := r.Get(ctx, req.NamespacedName, patchTracker); err != nil {
+		logger.Error(err, "unable to fetch PatchTracker")
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	// Finalizer name
+	finalizerName := "patchtracker.narada.io/finalizer"
+	// Examine DeletionTimestamp to determine if object is under deletion
+	if patchTracker.ObjectMeta.DeletionTimestamp.IsZero() {
+		// Object is not being deleted. Check for finalizer and add if not present.
+		if !controllerutil.ContainsFinalizer(patchTracker, finalizerName) {
+			// Copy object to perform a merge from patch
+			originalObject := patchTracker.DeepCopy()
+			// Updates object in memory
+			controllerutil.AddFinalizer(patchTracker, finalizerName)
+			// Updates object in the cluster
+			if err := r.Patch(ctx, patchTracker, client.MergeFrom(originalObject)); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+	} else {
+		// Object being deleted
+		if controllerutil.ContainsFinalizer(patchTracker, finalizerName) {
+			// Pre delete logic here
+			// Copy object to perform a merge from patch
+			originalObject := patchTracker.DeepCopy()
+			controllerutil.RemoveFinalizer(patchTracker, finalizerName)
+			if err := r.Patch(ctx, patchTracker, client.MergeFrom(originalObject)); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
 
 	return ctrl.Result{}, nil
 }
