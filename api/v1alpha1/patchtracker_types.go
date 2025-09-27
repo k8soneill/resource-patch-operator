@@ -68,12 +68,11 @@ type PatchField struct {
 
 // SecretRef identifies Secret dependencies which can trigger reconciles.
 type SecretRef struct {
-	Name string `json:"name,omitempty"`
 	// +kubebuilder:validation:Required
-	Namespace     string                `json:"namespace"`
-	LabelSelector *metav1.LabelSelector `json:"labelSelector,omitempty"`
-	// Optional indicates the Secret may be absent without causing an error.
-	Optional bool `json:"optional,omitempty"`
+	Name string `json:"name"`
+	// If no namespace provided defaults to patch tracker namespace
+	Namespace string `json:"namespace,omitempty"`
+	Optional  bool   `json:"optional,omitempty"`
 	// Watch controls whether changes to the Secret trigger reconciles (default true).
 	// +default:value=true
 	Watch bool `json:"watch,omitempty"`

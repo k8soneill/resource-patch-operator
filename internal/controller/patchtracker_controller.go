@@ -92,6 +92,28 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PatchTrackerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Runs an index function for every patchTracker object and stores a namespace/name value for all related secrets
+	// in memory. This allows us to trigger patchTracker reconciles when indexed secrets change.
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &naradav1alpha1.PatchTracker{}, "spec.secretRefs", func(obj client.Object) []string {
+		patchtrack := obj.(*naradav1alpha1.PatchTracker)
+		var keys []string
+		for _, target := range patchtrack.Spec.Targets {
+			for _, secret := range target.SecretDeps {
+				ns := secret.Namespace
+				if ns == "" {
+					ns = patchtrack.Namespace
+				}
+				if secret.Name == "" {
+					// skip unnamed secret refs. Can't be indexed but CRD validation should prevent this
+					continue
+				}
+				keys = append(keys, ns+"/"+secret.Name)
+			}
+		}
+		return keys
+	}); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&naradav1alpha1.PatchTracker{}).
 		Named("patchtracker").
