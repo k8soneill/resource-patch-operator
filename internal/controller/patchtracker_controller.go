@@ -60,7 +60,7 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Finalizer name
 	finalizerName := "patchtracker.narada.io/finalizer"
 	// Examine DeletionTimestamp to determine if object is under deletion
-	if patchTracker.ObjectMeta.DeletionTimestamp.IsZero() {
+	if patchTracker.GetDeletionTimestamp() == nil {
 		// Object is not being deleted. Check for finalizer and add if not present.
 		if !controllerutil.ContainsFinalizer(patchTracker, finalizerName) {
 			// Copy object to perform a merge from patch
