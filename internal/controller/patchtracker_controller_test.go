@@ -51,7 +51,29 @@ var _ = Describe("PatchTracker Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+						Targets: []resourcepatchv1alpha1.TargetRef{
+							{
+								APIVersion: "apps/v1",
+								Kind:       "Deployment",
+								Name:       "test-deployment",
+								Namespace:  "default",
+								PatchField: resourcepatchv1alpha1.PatchField{
+									Path: "spec.replicas",
+								},
+								SecretDeps: []resourcepatchv1alpha1.SecretRef{
+									{
+										Name:      "test-secret",
+										Namespace: "default",
+										Optional:  true,
+										Watch:     true,
+									},
+								},
+							},
+						},
+						PatchStrategy:       "strategicMerge",
+						IgnoreMissingTarget: true,
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
