@@ -27,7 +27,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	naradav1alpha1 "github.com/k8soneill/narada-operator/api/v1alpha1"
+	resourcepatchv1alpha1 "github.com/k8soneill/resource-patch-operator/api/v1alpha1"
 )
 
 var _ = Describe("PatchTracker Controller", func() {
@@ -40,13 +40,13 @@ var _ = Describe("PatchTracker Controller", func() {
 			Name:      resourceName,
 			Namespace: "default", // TODO(user):Modify as needed
 		}
-		patchtracker := &naradav1alpha1.PatchTracker{}
+		patchtracker := &resourcepatchv1alpha1.PatchTracker{}
 
 		BeforeEach(func() {
 			By("creating the custom resource for the Kind PatchTracker")
 			err := k8sClient.Get(ctx, typeNamespacedName, patchtracker)
 			if err != nil && errors.IsNotFound(err) {
-				resource := &naradav1alpha1.PatchTracker{
+				resource := &resourcepatchv1alpha1.PatchTracker{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      resourceName,
 						Namespace: "default",
@@ -59,7 +59,7 @@ var _ = Describe("PatchTracker Controller", func() {
 
 		AfterEach(func() {
 			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &naradav1alpha1.PatchTracker{}
+			resource := &resourcepatchv1alpha1.PatchTracker{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 

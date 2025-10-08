@@ -5,7 +5,7 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - narada.io.github.k8soneill
+  - resourcepatch.io.github.k8soneill
   resources:
   - patchtrackers
   verbs:
@@ -17,13 +17,13 @@ rules:
   - update
   - watch
 - apiGroups:
-  - narada.io.github.k8soneill
+  - resourcepatch.io.github.k8soneill
   resources:
   - patchtrackers/finalizers
   verbs:
   - update
 - apiGroups:
-  - narada.io.github.k8soneill
+  - resourcepatch.io.github.k8soneill
   resources:
   - patchtrackers/status
   verbs:

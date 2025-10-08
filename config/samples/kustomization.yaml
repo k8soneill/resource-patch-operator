@@ -1,4 +1,4 @@
 ## Append samples of your project ##
 resources:
-- narada_v1alpha1_patchtracker.yaml
+- resourcepatch_v1alpha1_patchtracker.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

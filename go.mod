@@ -1,4 +1,4 @@
-module github.com/k8soneill/narada-operator
+module github.com/k8soneill/resource-patch-operator
 
 go 1.24.0
 

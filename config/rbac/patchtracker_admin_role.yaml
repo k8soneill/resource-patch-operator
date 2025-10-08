@@ -1,7 +1,7 @@
-# This rule is not used by the project narada-operator itself.
-# It is provided to allow the cluster admin to help manage permissions for users.
-#
-# Grants full permissions ('*') over narada.io.github.k8soneill.
+# This rule is not used by the project resource-patch-operator itself.
+# It's here as an example for when the project starts supporting resource-patch-operator instances.
+# Feel free to remove if you won't need it.
+# Grants full permissions ('*') over resourcepatch.io.github.k8soneill.
 # This role is intended for users authorized to modify roles and bindings within the cluster,
 # enabling them to delegate specific permissions to other users or groups as needed.
 
@@ -9,18 +9,18 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   labels:
-    app.kubernetes.io/name: narada-operator
+    app.kubernetes.io/name: resource-patch-operator
     app.kubernetes.io/managed-by: kustomize
   name: patchtracker-admin-role
 rules:
 - apiGroups:
-  - narada.io.github.k8soneill
+  - resourcepatch.io.github.k8soneill
   resources:
   - patchtrackers
   verbs:
   - '*'
 - apiGroups:
-  - narada.io.github.k8soneill
+  - resourcepatch.io.github.k8soneill
   resources:
   - patchtrackers/status
   verbs:

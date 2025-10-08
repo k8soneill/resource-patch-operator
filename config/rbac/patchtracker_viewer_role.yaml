@@ -1,7 +1,7 @@
-# This rule is not used by the project narada-operator itself.
+# This rule is not used by the project resource-patch-operator itself.
 # It is provided to allow the cluster admin to help manage permissions for users.
 #
-# Grants read-only access to narada.io.github.k8soneill resources.
+# Grants read-only access to resourcepatch.io.github.k8soneill resources.
 # This role is intended for users who need visibility into these resources
 # without permissions to modify them. It is ideal for monitoring purposes and limited-access viewing.
 
@@ -9,12 +9,12 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   labels:
-    app.kubernetes.io/name: narada-operator
+    app.kubernetes.io/name: resource-patch-operator
     app.kubernetes.io/managed-by: kustomize
   name: patchtracker-viewer-role
 rules:
 - apiGroups:
-  - narada.io.github.k8soneill
+  - resourcepatch.io.github.k8soneill
   resources:
   - patchtrackers
   verbs:
@@ -22,7 +22,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - narada.io.github.k8soneill
+  - resourcepatch.io.github.k8soneill
   resources:
   - patchtrackers/status
   verbs:
