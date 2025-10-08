@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.18.0
-  name: patchtrackers.narada.io.github.k8soneill
+  name: patchtrackers.resourcepatch.io.github.k8soneill
 spec:
-  group: narada.io.github.k8soneill
+  group: resourcepatch.io.github.k8soneill
   names:
     kind: PatchTracker
     listKind: PatchTrackerList

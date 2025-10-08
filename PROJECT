@@ -8,16 +8,16 @@ layout:
 plugins:
   manifests.sdk.operatorframework.io/v2: {}
   scorecard.sdk.operatorframework.io/v2: {}
-projectName: narada-operator
-repo: github.com/k8soneill/narada-operator
+projectName: resource-patch-operator
+repo: github.com/k8soneill/resource-patch-operator
 resources:
 - api:
     crdVersion: v1
     namespaced: true
   controller: true
   domain: io.github.k8soneill
-  group: narada
+  group: resourcepatch
   kind: PatchTracker
-  path: github.com/k8soneill/narada-operator/api/v1alpha1
+  path: github.com/k8soneill/resource-patch-operator/api/v1alpha1
   version: v1alpha1
 version: "3"

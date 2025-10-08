@@ -1,8 +1,8 @@
-apiVersion: narada.io.github.k8soneill/v1alpha1
+apiVersion: resourcepatch.io.github.k8soneill/v1alpha1
 kind: PatchTracker
 metadata:
   labels:
-    app.kubernetes.io/name: narada-operator
+    app.kubernetes.io/name: resource-patch-operator
     app.kubernetes.io/managed-by: kustomize
   name: patchtracker-sample
 spec:

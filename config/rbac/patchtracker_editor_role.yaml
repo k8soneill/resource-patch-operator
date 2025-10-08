@@ -1,7 +1,7 @@
-# This rule is not used by the project narada-operator itself.
+# This rule is not used by the project resource-patch-operator itself.
 # It is provided to allow the cluster admin to help manage permissions for users.
 #
-# Grants permissions to create, update, and delete resources within the narada.io.github.k8soneill.
+# Grants permissions to create, update, and delete resources within the resourcepatch.io.github.k8soneill.
 # This role is intended for users who need to manage these resources
 # but should not control RBAC or manage permissions for others.
 
@@ -9,12 +9,12 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   labels:
-    app.kubernetes.io/name: narada-operator
+    app.kubernetes.io/name: resource-patch-operator
     app.kubernetes.io/managed-by: kustomize
   name: patchtracker-editor-role
 rules:
 - apiGroups:
-  - narada.io.github.k8soneill
+  - resourcepatch.io.github.k8soneill
   resources:
   - patchtrackers
   verbs:
@@ -26,7 +26,7 @@ rules:
   - update
   - watch
 - apiGroups:
-  - narada.io.github.k8soneill
+  - resourcepatch.io.github.k8soneill
   resources:
   - patchtrackers/status
   verbs:

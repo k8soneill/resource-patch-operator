@@ -25,7 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	naradav1alpha1 "github.com/k8soneill/narada-operator/api/v1alpha1"
+	resourcepatchv1alpha1 "github.com/k8soneill/resource-patch-operator/api/v1alpha1"
 )
 
 // PatchTrackerReconciler reconciles a PatchTracker object
@@ -34,9 +34,9 @@ type PatchTrackerReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=narada.io.github.k8soneill,resources=patchtrackers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=narada.io.github.k8soneill,resources=patchtrackers/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=narada.io.github.k8soneill,resources=patchtrackers/finalizers,verbs=update
+// +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers/finalizers,verbs=update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -52,13 +52,13 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	logger := logf.FromContext(ctx)
 
 	// Fetch patchTracker instance
-	patchTracker := &naradav1alpha1.PatchTracker{}
+	patchTracker := &resourcepatchv1alpha1.PatchTracker{}
 	if err := r.Get(ctx, req.NamespacedName, patchTracker); err != nil {
 		logger.Error(err, "unable to fetch PatchTracker")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	// Finalizer name
-	finalizerName := "patchtracker.narada.io/finalizer"
+	finalizerName := "patchtracker.resourcepatch.io/finalizer"
 	// Examine DeletionTimestamp to determine if object is under deletion
 	if patchTracker.GetDeletionTimestamp() == nil {
 		// Object is not being deleted. Check for finalizer and add if not present.
@@ -94,8 +94,8 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 func (r *PatchTrackerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Runs an index function for every patchTracker object and stores a namespace/name value for all related secrets
 	// in memory. This allows us to trigger patchTracker reconciles when indexed secrets change.
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &naradav1alpha1.PatchTracker{}, "spec.secretRefs", func(obj client.Object) []string {
-		patchtrack := obj.(*naradav1alpha1.PatchTracker)
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &resourcepatchv1alpha1.PatchTracker{}, "spec.secretRefs", func(obj client.Object) []string {
+		patchtrack := obj.(*resourcepatchv1alpha1.PatchTracker)
 		var keys []string
 		for _, target := range patchtrack.Spec.Targets {
 			for _, secret := range target.SecretDeps {
@@ -115,7 +115,7 @@ func (r *PatchTrackerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&naradav1alpha1.PatchTracker{}).
+		For(&resourcepatchv1alpha1.PatchTracker{}).
 		Named("patchtracker").
 		Complete(r)
 }
