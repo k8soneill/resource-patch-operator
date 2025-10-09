@@ -19,7 +19,10 @@ package controller
 import (
 	"context"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -85,6 +88,43 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			}
 		}
 		return ctrl.Result{}, nil
+	}
+
+	// Logic for checking watched object
+	// Iterate through targets list
+	for _, target := range patchTracker.Spec.Targets {
+		// Iterate through secret dependencies of target
+		for _, secretDep := range target.SecretDeps {
+			// Set secret name and namespace
+			secretName := secretDep.Name
+			secretNamespace := secretDep.Namespace
+			// Default to target namespace if not explicitly set on secret
+			if secretNamespace == "" {
+				secretNamespace = target.Namespace
+			}
+			// Check if secret should be watched for changes
+			if secretDep.Watch {
+				// Create namespaced name secret
+				secretNamespacedName := types.NamespacedName{
+					Name:      secretName,
+					Namespace: secretNamespace,
+				}
+				// Fetch the secret
+				secret := &corev1.Secret{}
+				if err := r.Get(ctx, secretNamespacedName, secret); err != nil {
+					// If not found and optional move on to next secret in the loop
+					if apierrors.IsNotFound(err) {
+						if secretDep.Optional {
+							logger.Info("Secret is missing but optional. Not erroring.", "secret", secretName, "namespace", secretNamespace)
+							continue
+						}
+					}
+				}
+
+			} else {
+				logger.Info("Skipping unwatched secret", "secret", secretName, "namespace", secretNamespace)
+			}
+		}
 	}
 
 	return ctrl.Result{}, nil

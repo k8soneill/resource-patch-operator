@@ -72,7 +72,9 @@ type SecretRef struct {
 	Name string `json:"name"`
 	// If no namespace provided defaults to patch tracker namespace
 	Namespace string `json:"namespace,omitempty"`
-	Optional  bool   `json:"optional,omitempty"`
+	// If false then reconciliation will error if secret does not exist
+	// +default:value=false
+	Optional bool `json:"optional,omitempty"`
 	// Watch controls whether changes to the Secret trigger reconciles (default true).
 	// +default:value=true
 	Watch bool `json:"watch,omitempty"`
