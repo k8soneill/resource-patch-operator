@@ -26,7 +26,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	resourcepatchv1alpha1 "github.com/k8soneill/resource-patch-operator/api/v1alpha1"
 )
@@ -60,6 +62,13 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		logger.Error(err, "unable to fetch PatchTracker")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+
+	// Print PatchTracker name for testing
+	logger.Info("🎯 RECONCILING PatchTracker",
+		"name", patchTracker.Name,
+		"namespace", patchTracker.Namespace,
+		"targets", len(patchTracker.Spec.Targets),
+		"generation", patchTracker.Generation)
 	// Finalizer name
 	finalizerName := "patchtracker.resourcepatch.io/finalizer"
 	// Examine DeletionTimestamp to determine if object is under deletion
@@ -130,6 +139,40 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, nil
 }
 
+// findPatchTrackersForSecret maps Secret changes to PatchTracker reconcile requests
+func (r *PatchTrackerReconciler) findPatchTrackersForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	secret := obj.(*corev1.Secret)
+	secretKey := secret.Namespace + "/" + secret.Name
+
+	// Use the custom index to find PatchTrackers that reference this Secret
+	var patchTrackers resourcepatchv1alpha1.PatchTrackerList
+	if err := r.List(ctx, &patchTrackers, client.MatchingFields{"spec.secretRefs": secretKey}); err != nil {
+		// Log error but don't prevent other processing
+		logf.FromContext(ctx).Error(err, "Failed to find PatchTrackers for Secret", "secret", secretKey)
+		return nil
+	}
+
+	// Convert PatchTrackers to reconcile requests
+	var requests []reconcile.Request
+	for _, pt := range patchTrackers.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      pt.Name,
+				Namespace: pt.Namespace,
+			},
+		})
+	}
+
+	// Log how many PatchTrackers will be reconciled
+	if len(requests) > 0 {
+		logf.FromContext(ctx).Info("Secret change will trigger PatchTracker reconciles",
+			"secret", secretKey,
+			"patchTrackerCount", len(requests))
+	}
+
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *PatchTrackerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Runs an index function for every patchTracker object and stores a namespace/name value for all related secrets
@@ -156,6 +199,10 @@ func (r *PatchTrackerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&resourcepatchv1alpha1.PatchTracker{}).
+		Watches(
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.findPatchTrackersForSecret),
+		).
 		Named("patchtracker").
 		Complete(r)
 }

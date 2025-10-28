@@ -156,6 +156,9 @@ spec:
                               tracker namespace
                             type: string
                           optional:
+                            default: false
+                            description: If false then reconciliation will error if
+                              secret does not exist
                             type: boolean
                           watch:
                             default: true
