@@ -1,0 +1,23 @@
+apiVersion: resourcepatch.io.github.k8soneill/v1alpha1
+kind: PatchTracker
+metadata:
+  name: test-patchtracker
+  namespace: default
+spec:
+  targets:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: sample-deployment
+      namespace: default
+      patchField:
+        path: "spec.replicas"
+      secretDeps:
+        - name: sample-config-secret
+          namespace: default
+          optional: false
+          watch: true
+  reconcile:
+    requeueAfter: "30s"
+    debounce: "5s"
+  patchStrategy: "strategicMerge"
+  ignoreMissingTarget: false
