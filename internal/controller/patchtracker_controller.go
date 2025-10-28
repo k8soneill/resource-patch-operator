@@ -64,11 +64,10 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Print PatchTracker name for testing
-	logger.Info("🎯 RECONCILING PatchTracker",
+	logger.Info("RECONCILING PatchTracker",
 		"name", patchTracker.Name,
 		"namespace", patchTracker.Namespace,
-		"targets", len(patchTracker.Spec.Targets),
-		"generation", patchTracker.Generation)
+		"targets", len(patchTracker.Spec.Targets))
 	// Finalizer name
 	finalizerName := "patchtracker.resourcepatch.io/finalizer"
 	// Examine DeletionTimestamp to determine if object is under deletion
@@ -153,7 +152,7 @@ func (r *PatchTrackerReconciler) findPatchTrackersForSecret(ctx context.Context,
 	}
 
 	// Convert PatchTrackers to reconcile requests
-	var requests []reconcile.Request
+	requests := []reconcile.Request{}
 	for _, pt := range patchTrackers.Items {
 		requests = append(requests, reconcile.Request{
 			NamespacedName: types.NamespacedName{
