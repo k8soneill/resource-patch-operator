@@ -99,11 +99,15 @@ type PatchTrackerStatus struct {
 	// LastReconcileTime is the time the controller last completed a reconcile.
 	LastReconcileTime *metav1.Time `json:"lastReconcileTime,omitempty"`
 
-	// LastAppliedHash is a hash of the watched fields and secret data used to detect changes.
-	LastAppliedHash string `json:"lastAppliedHash,omitempty"`
-
 	// TrackedResources lists resources that this PatchTracker is observing.
 	TrackedResources []TrackedResource `json:"trackedResources,omitempty"`
+
+	// LastPatchTime tracks when patches were last applied to targets
+	LastPatchTime *metav1.Time `json:"lastPatchTime,omitempty"`
+
+	// SecretVersions tracks the resourceVersion of each watched secret
+	// Key: "namespace/secretname", Value: resourceVersion
+	SecretVersions map[string]string `json:"secretVersions,omitempty"`
 }
 
 // TrackedResource records an observed resource and its last seen state.

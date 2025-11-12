@@ -18,9 +18,11 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -42,16 +44,6 @@ type PatchTrackerReconciler struct {
 // +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers/finalizers,verbs=update
-
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the PatchTracker object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
 func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	// Setup logger object
 	logger := logf.FromContext(ctx)
@@ -98,7 +90,101 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
-	// Logic for checking watched object
+	// Check if we should apply patches based on secret changes
+	shouldPatch, err := r.shouldApplyPatch(ctx, patchTracker)
+	if err != nil {
+		logger.Error(err, "Failed to determine if patch should be applied")
+		return ctrl.Result{}, err
+	}
+
+	if shouldPatch {
+		logger.Info("Applying patches due to secret changes")
+		// TODO: Implement actual patching logic here
+
+		// Update tracking status after successful patch
+		if err := r.updateTrackingStatus(ctx, patchTracker); err != nil {
+			logger.Error(err, "Failed to update tracking status")
+			return ctrl.Result{}, err
+		}
+	} else {
+		logger.Info("No patches needed, all secrets up to date")
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker) error {
+	logger := logf.FromContext(ctx)
+
+	// Get the latest version of the object to avoid conflicts
+	latest := &resourcepatchv1alpha1.PatchTracker{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(patchTracker), latest); err != nil {
+		return err
+	}
+
+	statusPatch := latest.DeepCopy()
+
+	// Initialize status fields if needed
+	if statusPatch.Status.SecretVersions == nil {
+		statusPatch.Status.SecretVersions = make(map[string]string)
+	}
+
+	// Update secret versions based on current state
+	updated := false
+	for _, target := range patchTracker.Spec.Targets {
+		for _, secretDep := range target.SecretDeps {
+			if secretDep.Watch {
+				secretName := secretDep.Name
+				secretNamespace := secretDep.Namespace
+				if secretNamespace == "" {
+					secretNamespace = target.Namespace
+				}
+
+				// Fetch current secret version
+				secretNamespacedName := types.NamespacedName{
+					Name:      secretName,
+					Namespace: secretNamespace,
+				}
+				secret := &corev1.Secret{}
+				if err := r.Get(ctx, secretNamespacedName, secret); err != nil {
+					if !apierrors.IsNotFound(err) {
+						return err
+					}
+					// Secret not found, skip version tracking
+					continue
+				}
+
+				secretKey := secretNamespace + "/" + secretName
+				currentVersion := string(secret.ResourceVersion)
+				if statusPatch.Status.SecretVersions[secretKey] != currentVersion {
+					statusPatch.Status.SecretVersions[secretKey] = currentVersion
+					updated = true
+				}
+			}
+		}
+	}
+
+	// Only update if something changed
+	if updated {
+		statusPatch.Status.LastPatchTime = &metav1.Time{Time: time.Now()}
+
+		if err := r.Status().Update(ctx, statusPatch); err != nil {
+			if apierrors.IsConflict(err) {
+				logger.Info("Status update conflict, will retry on next reconcile", "error", err.Error())
+				return nil // Don't treat conflicts as fatal errors
+			}
+			logger.Error(err, "Failed to update PatchTracker status")
+			return err
+		}
+		logger.Info("Updated PatchTracker status with new secret versions")
+	}
+
+	return nil
+}
+
+func (r *PatchTrackerReconciler) shouldApplyPatch(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker) (bool, error) {
+	logger := logf.FromContext(ctx)
+
 	// Iterate through targets list
 	for _, target := range patchTracker.Spec.Targets {
 		// Iterate through secret dependencies of target
@@ -110,6 +196,7 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			if secretNamespace == "" {
 				secretNamespace = target.Namespace
 			}
+
 			// Check if secret should be watched for changes
 			if secretDep.Watch {
 				// Create namespaced name secret
@@ -125,17 +212,36 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 						if secretDep.Optional {
 							logger.Info("Secret is missing but optional. Not erroring.", "secret", secretName, "namespace", secretNamespace)
 							continue
+						} else {
+							logger.Error(err, "Required secret not found", "secret", secretName, "namespace", secretNamespace)
+							return false, err
 						}
 					}
+					// Other errors should be returned
+					logger.Error(err, "Failed to fetch secret", "secret", secretName, "namespace", secretNamespace)
+					return false, err
 				}
 
+				// Check if this secret version has changed
+				secretKey := secretNamespace + "/" + secretName
+				currentVersion := string(secret.ResourceVersion)
+				lastKnownVersion, exists := patchTracker.Status.SecretVersions[secretKey]
+
+				if !exists || lastKnownVersion != currentVersion {
+					logger.Info("Secret version changed, should apply patch",
+						"secret", secretKey,
+						"currentVersion", currentVersion,
+						"lastKnownVersion", lastKnownVersion)
+					return true, nil
+				}
 			} else {
 				logger.Info("Skipping unwatched secret", "secret", secretName, "namespace", secretNamespace)
 			}
 		}
 	}
 
-	return ctrl.Result{}, nil
+	logger.Info("No secret changes detected, skipping patch")
+	return false, nil
 }
 
 // findPatchTrackersForSecret maps Secret changes to PatchTracker reconcile requests
