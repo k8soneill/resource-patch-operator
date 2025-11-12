@@ -155,7 +155,7 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 				}
 
 				secretKey := secretNamespace + "/" + secretName
-				currentVersion := string(secret.ResourceVersion)
+				currentVersion := secret.ResourceVersion
 				if statusPatch.Status.SecretVersions[secretKey] != currentVersion {
 					statusPatch.Status.SecretVersions[secretKey] = currentVersion
 					updated = true
@@ -224,7 +224,7 @@ func (r *PatchTrackerReconciler) shouldApplyPatch(ctx context.Context, patchTrac
 
 				// Check if this secret version has changed
 				secretKey := secretNamespace + "/" + secretName
-				currentVersion := string(secret.ResourceVersion)
+				currentVersion := secret.ResourceVersion
 				lastKnownVersion, exists := patchTracker.Status.SecretVersions[secretKey]
 
 				if !exists || lastKnownVersion != currentVersion {
