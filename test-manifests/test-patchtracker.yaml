@@ -10,7 +10,8 @@ spec:
       name: sample-deployment
       namespace: default
       patchField:
-        path: "spec.replicas"
+        # This annotation triggers a rollout when updated
+        path: "spec.template.metadata.annotations"
       secretDeps:
         - name: sample-config-secret
           namespace: default

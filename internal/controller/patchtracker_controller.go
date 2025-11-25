@@ -18,12 +18,17 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,6 +40,22 @@ import (
 	resourcepatchv1alpha1 "github.com/k8soneill/resource-patch-operator/api/v1alpha1"
 )
 
+// PatchOperation holds all the information needed to apply a patch to a target
+type PatchOperation struct {
+	// Target is the resource reference that needs patching
+	Target resourcepatchv1alpha1.TargetRef
+	// ChangedSecrets contains the secrets that changed and triggered this patch
+	ChangedSecrets []SecretChange
+}
+
+// SecretChange tracks a secret that changed and its new data
+type SecretChange struct {
+	Name            string
+	Namespace       string
+	ResourceVersion string
+	Data            map[string][]byte
+}
+
 // PatchTrackerReconciler reconciles a PatchTracker object
 type PatchTrackerReconciler struct {
 	client.Client
@@ -44,6 +65,10 @@ type PatchTrackerReconciler struct {
 // +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps;services;pods,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets;daemonsets;replicasets,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=batch,resources=jobs;cronjobs,verbs=get;list;watch;patch
 func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	// Setup logger object
 	logger := logf.FromContext(ctx)
@@ -90,16 +115,31 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
-	// Check if we should apply patches based on secret changes
-	shouldPatch, err := r.shouldApplyPatch(ctx, patchTracker)
+	// Get list of patch operations needed based on secret changes
+	patchOps, err := r.getPatchOperations(ctx, patchTracker)
 	if err != nil {
-		logger.Error(err, "Failed to determine if patch should be applied")
+		logger.Error(err, "Failed to determine patch operations")
 		return ctrl.Result{}, err
 	}
 
-	if shouldPatch {
-		logger.Info("Applying patches due to secret changes")
-		// TODO: Implement actual patching logic here
+	if len(patchOps) > 0 {
+		logger.Info("Applying patches due to secret changes", "patchCount", len(patchOps))
+
+		// Apply each patch operation
+		for _, patchOp := range patchOps {
+			if err := r.applyPatchToTarget(ctx, patchTracker, patchOp); err != nil {
+				logger.Error(err, "Failed to apply patch to target",
+					"target", fmt.Sprintf("%s/%s", patchOp.Target.Namespace, patchOp.Target.Name),
+					"kind", patchOp.Target.Kind)
+				// Continue with other patches, but record the error
+				// TODO: Consider how to handle partial failures
+				continue
+			}
+			logger.Info("Successfully applied patch to target",
+				"target", fmt.Sprintf("%s/%s", patchOp.Target.Namespace, patchOp.Target.Name),
+				"kind", patchOp.Target.Kind,
+				"patchPath", patchOp.Target.PatchField.Path)
+		}
 
 		// Update tracking status after successful patch
 		if err := r.updateTrackingStatus(ctx, patchTracker); err != nil {
@@ -182,11 +222,16 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 	return nil
 }
 
-func (r *PatchTrackerReconciler) shouldApplyPatch(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker) (bool, error) {
+// getPatchOperations determines which targets need patching based on secret changes
+// Returns a list of PatchOperations, each containing the target and the secrets that changed
+func (r *PatchTrackerReconciler) getPatchOperations(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker) ([]PatchOperation, error) {
 	logger := logf.FromContext(ctx)
+	var patchOps []PatchOperation
 
 	// Iterate through targets list
 	for _, target := range patchTracker.Spec.Targets {
+		var changedSecrets []SecretChange
+
 		// Iterate through secret dependencies of target
 		for _, secretDep := range target.SecretDeps {
 			// Set secret name and namespace
@@ -214,12 +259,12 @@ func (r *PatchTrackerReconciler) shouldApplyPatch(ctx context.Context, patchTrac
 							continue
 						} else {
 							logger.Error(err, "Required secret not found", "secret", secretName, "namespace", secretNamespace)
-							return false, err
+							return nil, err
 						}
 					}
 					// Other errors should be returned
 					logger.Error(err, "Failed to fetch secret", "secret", secretName, "namespace", secretNamespace)
-					return false, err
+					return nil, err
 				}
 
 				// Check if this secret version has changed
@@ -228,20 +273,247 @@ func (r *PatchTrackerReconciler) shouldApplyPatch(ctx context.Context, patchTrac
 				lastKnownVersion, exists := patchTracker.Status.SecretVersions[secretKey]
 
 				if !exists || lastKnownVersion != currentVersion {
-					logger.Info("Secret version changed, should apply patch",
+					logger.Info("Secret version changed, adding to patch operation",
 						"secret", secretKey,
 						"currentVersion", currentVersion,
 						"lastKnownVersion", lastKnownVersion)
-					return true, nil
+					changedSecrets = append(changedSecrets, SecretChange{
+						Name:            secretName,
+						Namespace:       secretNamespace,
+						ResourceVersion: currentVersion,
+						Data:            secret.Data,
+					})
 				}
 			} else {
-				logger.Info("Skipping unwatched secret", "secret", secretName, "namespace", secretNamespace)
+				logger.V(1).Info("Skipping unwatched secret", "secret", secretName, "namespace", secretNamespace)
 			}
+		}
+
+		// If any secrets changed for this target, add it to the patch operations
+		if len(changedSecrets) > 0 {
+			patchOps = append(patchOps, PatchOperation{
+				Target:         target,
+				ChangedSecrets: changedSecrets,
+			})
 		}
 	}
 
-	logger.Info("No secret changes detected, skipping patch")
-	return false, nil
+	if len(patchOps) == 0 {
+		logger.Info("No secret changes detected, skipping patch")
+	}
+
+	return patchOps, nil
+}
+
+// applyPatchToTarget applies the patch to the target resource using a dynamic client
+func (r *PatchTrackerReconciler) applyPatchToTarget(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker, patchOp PatchOperation) error {
+	logger := logf.FromContext(ctx)
+	target := patchOp.Target
+
+	// Parse the apiVersion to get group and version
+	gv, err := schema.ParseGroupVersion(target.APIVersion)
+	if err != nil {
+		return fmt.Errorf("invalid apiVersion %q: %w", target.APIVersion, err)
+	}
+
+	// Create the GVK for the target resource
+	gvk := schema.GroupVersionKind{
+		Group:   gv.Group,
+		Version: gv.Version,
+		Kind:    target.Kind,
+	}
+
+	logger.Info("Applying patch to target",
+		"gvk", gvk.String(),
+		"name", target.Name,
+		"namespace", target.Namespace,
+		"patchPath", target.PatchField.Path)
+
+	// Use unstructured to handle any resource type
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+
+	// Get the target resource
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      target.Name,
+		Namespace: target.Namespace,
+	}, obj); err != nil {
+		if apierrors.IsNotFound(err) && patchTracker.Spec.IgnoreMissingTarget {
+			logger.Info("Target resource not found, ignoring due to IgnoreMissingTarget=true",
+				"name", target.Name,
+				"namespace", target.Namespace)
+			return nil
+		}
+		return fmt.Errorf("failed to get target resource: %w", err)
+	}
+
+	// Build the patch value from the changed secrets
+	patchValue, err := r.buildPatchValue(patchOp.ChangedSecrets)
+	if err != nil {
+		return fmt.Errorf("failed to build patch value: %w", err)
+	}
+
+	// Apply the patch based on the strategy
+	switch patchTracker.Spec.PatchStrategy {
+	case "none":
+		logger.Info("PatchStrategy is 'none', skipping actual patch application")
+		return nil
+	case "jsonPatch":
+		return r.applyJSONPatch(ctx, obj, target.PatchField.Path, patchValue)
+	case "strategicMerge", "":
+		return r.applyStrategicMergePatch(ctx, obj, target.PatchField.Path, patchValue)
+	case "serverSideApply":
+		return r.applyServerSideApply(ctx, obj, target.PatchField.Path, patchValue, patchTracker.Name)
+	default:
+		return fmt.Errorf("unknown patch strategy: %s", patchTracker.Spec.PatchStrategy)
+	}
+}
+
+// buildPatchValue constructs the value to patch from the changed secrets
+// For annotation paths, it creates annotations that can trigger rollouts
+// For other paths, it returns the secret data as a map
+func (r *PatchTrackerReconciler) buildPatchValue(changedSecrets []SecretChange) (interface{}, error) {
+	result := make(map[string]interface{})
+
+	// Add a timestamp annotation to trigger rollouts
+	result["resourcepatch.io/last-updated"] = time.Now().Format(time.RFC3339)
+
+	// Add version info for each secret that changed
+	for _, secret := range changedSecrets {
+		annotationKey := fmt.Sprintf("resourcepatch.io/secret-%s-version", secret.Name)
+		result[annotationKey] = secret.ResourceVersion
+	}
+
+	return result, nil
+}
+
+// setNestedField sets a value at a nested path in an unstructured object
+// path is in format "spec.template.spec.containers[0].env"
+func setNestedField(obj map[string]interface{}, value interface{}, path string) error {
+	parts := strings.Split(path, ".")
+	current := obj
+
+	for i, part := range parts {
+		if i == len(parts)-1 {
+			// Last part - set the value
+			current[part] = value
+			return nil
+		}
+
+		// Navigate to the next level
+		if next, ok := current[part]; ok {
+			if nextMap, ok := next.(map[string]interface{}); ok {
+				current = nextMap
+			} else {
+				return fmt.Errorf("path element %q is not an object", part)
+			}
+		} else {
+			// Create the path if it doesn't exist
+			newMap := make(map[string]interface{})
+			current[part] = newMap
+			current = newMap
+		}
+	}
+
+	return nil
+}
+
+// applyJSONPatch applies a JSON Patch (RFC 6902) to the target
+func (r *PatchTrackerReconciler) applyJSONPatch(ctx context.Context, obj *unstructured.Unstructured, path string, value interface{}) error {
+	logger := logf.FromContext(ctx)
+
+	// Convert path from dot notation to JSON Pointer (RFC 6901)
+	jsonPointerPath := "/" + strings.ReplaceAll(path, ".", "/")
+
+	// Build JSON Patch operation
+	patchOps := []map[string]interface{}{
+		{
+			"op":    "replace",
+			"path":  jsonPointerPath,
+			"value": value,
+		},
+	}
+
+	patchBytes, err := json.Marshal(patchOps)
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON patch: %w", err)
+	}
+
+	logger.Info("Applying JSON patch", "patch", string(patchBytes))
+
+	// Apply the patch
+	if err := r.Patch(ctx, obj, client.RawPatch(types.JSONPatchType, patchBytes)); err != nil {
+		return fmt.Errorf("failed to apply JSON patch: %w", err)
+	}
+
+	return nil
+}
+
+// applyStrategicMergePatch applies a strategic merge patch to the target
+func (r *PatchTrackerReconciler) applyStrategicMergePatch(ctx context.Context, obj *unstructured.Unstructured, path string, value interface{}) error {
+	logger := logf.FromContext(ctx)
+
+	// Build the patch document with the value at the specified path
+	patchDoc := make(map[string]interface{})
+	if err := setNestedField(patchDoc, value, path); err != nil {
+		return fmt.Errorf("failed to build patch document: %w", err)
+	}
+
+	patchBytes, err := json.Marshal(patchDoc)
+	if err != nil {
+		return fmt.Errorf("failed to marshal patch document: %w", err)
+	}
+
+	logger.Info("Applying strategic merge patch", "patch", string(patchBytes))
+
+	// Apply the patch
+	if err := r.Patch(ctx, obj, client.RawPatch(types.StrategicMergePatchType, patchBytes)); err != nil {
+		// Fall back to merge patch for custom resources that don't support strategic merge
+		logger.Info("Strategic merge patch failed, falling back to merge patch", "error", err.Error())
+		if err := r.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchBytes)); err != nil {
+			return fmt.Errorf("failed to apply merge patch: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// applyServerSideApply applies changes using server-side apply
+func (r *PatchTrackerReconciler) applyServerSideApply(ctx context.Context, obj *unstructured.Unstructured, path string, value interface{}, fieldManager string) error {
+	logger := logf.FromContext(ctx)
+
+	// Build the patch document with the value at the specified path
+	patchDoc := map[string]interface{}{
+		"apiVersion": obj.GetAPIVersion(),
+		"kind":       obj.GetKind(),
+		"metadata": map[string]interface{}{
+			"name":      obj.GetName(),
+			"namespace": obj.GetNamespace(),
+		},
+	}
+	if err := setNestedField(patchDoc, value, path); err != nil {
+		return fmt.Errorf("failed to build SSA patch document: %w", err)
+	}
+
+	patchBytes, err := json.Marshal(patchDoc)
+	if err != nil {
+		return fmt.Errorf("failed to marshal SSA patch document: %w", err)
+	}
+
+	logger.Info("Applying server-side apply", "patch", string(patchBytes), "fieldManager", fieldManager)
+
+	// Apply using server-side apply
+	patchObj := &unstructured.Unstructured{}
+	patchObj.SetGroupVersionKind(obj.GroupVersionKind())
+	if err := json.Unmarshal(patchBytes, &patchObj.Object); err != nil {
+		return fmt.Errorf("failed to unmarshal patch object: %w", err)
+	}
+
+	if err := r.Patch(ctx, patchObj, client.Apply, client.FieldOwner(fieldManager), client.ForceOwnership); err != nil {
+		return fmt.Errorf("failed to apply server-side apply: %w", err)
+	}
+
+	return nil
 }
 
 // findPatchTrackersForSecret maps Secret changes to PatchTracker reconcile requests
