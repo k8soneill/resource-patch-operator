@@ -4,6 +4,7 @@ kind: ClusterRole
 metadata:
   name: manager-role
 rules:
+# PatchTracker permissions
 - apiGroups:
   - resourcepatch.io.github.k8soneill
   resources:
@@ -30,3 +31,48 @@ rules:
   - get
   - patch
   - update
+# Secret permissions (cluster-wide for watching)
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+# Core resources that can be patched
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - services
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+  - patch
+# Apps resources that can be patched
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - statefulsets
+  - daemonsets
+  - replicasets
+  verbs:
+  - get
+  - list
+  - watch
+  - patch
+# Batch resources that can be patched
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  - cronjobs
+  verbs:
+  - get
+  - list
+  - watch
+  - patch
