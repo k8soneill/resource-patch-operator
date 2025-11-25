@@ -4,7 +4,7 @@ metadata:
   name: sample-deployment
   namespace: default
 spec:
-  replicas: 1  # This will be the field we patch
+  replicas: 1
   selector:
     matchLabels:
       app: sample-app

@@ -10,7 +10,9 @@ spec:
       name: sample-deployment
       namespace: default
       patchField:
-        path: "spec.replicas"
+        # This annotation triggers a rollout when updated
+        path: "spec.template.metadata.annotations"
+      patchStrategy: strategicMerge  # Now per-target!
       secretDeps:
         - name: sample-config-secret
           namespace: default
@@ -19,5 +21,4 @@ spec:
   reconcile:
     requeueAfter: "30s"
     debounce: "5s"
-  patchStrategy: "strategicMerge"
   ignoreMissingTarget: false

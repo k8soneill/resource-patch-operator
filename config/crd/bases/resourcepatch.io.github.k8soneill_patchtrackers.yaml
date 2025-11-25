@@ -44,12 +44,6 @@ spec:
                 description: IgnoreMissingTarget controls whether a missing target
                   resource is treated as an error.
                 type: boolean
-              patchStrategy:
-                default: strategicMerge
-                description: |-
-                  PatchStrategy determines how the controller will apply changes when acting.
-                  Allowed values: "none", "jsonPatch", "strategicMerge", "serverSideApply".
-                type: string
               reconcile:
                 description: Reconcile controls when reconciles are triggered and
                   timing options.
@@ -144,6 +138,17 @@ spec:
                       required:
                       - path
                       type: object
+                    patchStrategy:
+                      default: strategicMerge
+                      description: |-
+                        PatchStrategy determines how the controller will apply changes to this target.
+                        Allowed values: "none", "jsonPatch", "strategicMerge", "serverSideApply".
+                      enum:
+                      - none
+                      - jsonPatch
+                      - strategicMerge
+                      - serverSideApply
+                      type: string
                     secretDeps:
                       items:
                         description: SecretRef identifies Secret dependencies which
@@ -241,9 +246,10 @@ spec:
                   - type
                   type: object
                 type: array
-              lastAppliedHash:
-                description: LastAppliedHash is a hash of the watched fields and secret
-                  data used to detect changes.
+              lastPatchTime:
+                description: LastPatchTime tracks when patches were last applied to
+                  targets
+                format: date-time
                 type: string
               lastReconcileTime:
                 description: LastReconcileTime is the time the controller last completed
@@ -255,6 +261,13 @@ spec:
                   by the controller.
                 format: int64
                 type: integer
+              secretVersions:
+                additionalProperties:
+                  type: string
+                description: |-
+                  SecretVersions tracks the resourceVersion of each watched secret
+                  Key: "namespace/secretname", Value: resourceVersion
+                type: object
               trackedResources:
                 description: TrackedResources lists resources that this PatchTracker
                   is observing.

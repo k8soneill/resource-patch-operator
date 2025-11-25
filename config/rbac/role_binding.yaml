@@ -11,5 +11,5 @@ roleRef:
   name: manager-role
 subjects:
 - kind: ServiceAccount
-  name: controller-manager
-  namespace: system
+  name: resource-patch-operator-controller-manager
+  namespace: resource-patch-operator-system
