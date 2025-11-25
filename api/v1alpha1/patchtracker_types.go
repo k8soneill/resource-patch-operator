@@ -29,11 +29,6 @@ type PatchTrackerSpec struct {
 	// Reconcile controls when reconciles are triggered and timing options.
 	Reconcile ReconcileOptions `json:"reconcile,omitempty"`
 
-	// PatchStrategy determines how the controller will apply changes when acting.
-	// Allowed values: "none", "jsonPatch", "strategicMerge", "serverSideApply".
-	// +default:value="strategicMerge"
-	PatchStrategy string `json:"patchStrategy,omitempty"`
-
 	// ServiceAccountName is an optional hint for RBAC (which SA will be used to read targets).
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
@@ -55,6 +50,11 @@ type TargetRef struct {
 	LabelSelector *metav1.LabelSelector `json:"labelSelector,omitempty"`
 	// +kubebuilder:validation:Required
 	PatchField PatchField `json:"patchField"`
+	// PatchStrategy determines how the controller will apply changes to this target.
+	// Allowed values: "none", "jsonPatch", "strategicMerge", "serverSideApply".
+	// +kubebuilder:validation:Enum=none;jsonPatch;strategicMerge;serverSideApply
+	// +default:value="strategicMerge"
+	PatchStrategy string `json:"patchStrategy,omitempty"`
 	// +kubebuilder:validation:Required
 	SecretDeps []SecretRef `json:"secretDeps"`
 }

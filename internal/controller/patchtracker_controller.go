@@ -40,22 +40,6 @@ import (
 	resourcepatchv1alpha1 "github.com/k8soneill/resource-patch-operator/api/v1alpha1"
 )
 
-// PatchOperation holds all the information needed to apply a patch to a target
-type PatchOperation struct {
-	// Target is the resource reference that needs patching
-	Target resourcepatchv1alpha1.TargetRef
-	// ChangedSecrets contains the secrets that changed and triggered this patch
-	ChangedSecrets []SecretChange
-}
-
-// SecretChange tracks a secret that changed and its new data
-type SecretChange struct {
-	Name            string
-	Namespace       string
-	ResourceVersion string
-	Data            map[string][]byte
-}
-
 // PatchTrackerReconciler reconciles a PatchTracker object
 type PatchTrackerReconciler struct {
 	client.Client
@@ -115,30 +99,30 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
-	// Get list of patch operations needed based on secret changes
-	patchOps, err := r.getPatchOperations(ctx, patchTracker)
+	// Get list of targets that need patching based on secret changes
+	targetsToPatch, err := r.getTargetsToPatch(ctx, patchTracker)
 	if err != nil {
-		logger.Error(err, "Failed to determine patch operations")
+		logger.Error(err, "Failed to determine targets to patch")
 		return ctrl.Result{}, err
 	}
 
-	if len(patchOps) > 0 {
-		logger.Info("Applying patches due to secret changes", "patchCount", len(patchOps))
+	if len(targetsToPatch) > 0 {
+		logger.Info("Applying patches due to secret changes", "targetCount", len(targetsToPatch))
 
-		// Apply each patch operation
-		for _, patchOp := range patchOps {
-			if err := r.applyPatchToTarget(ctx, patchTracker, patchOp); err != nil {
+		// Apply patch to each target
+		for _, target := range targetsToPatch {
+			if err := r.applyPatchToTarget(ctx, patchTracker, target); err != nil {
 				logger.Error(err, "Failed to apply patch to target",
-					"target", fmt.Sprintf("%s/%s", patchOp.Target.Namespace, patchOp.Target.Name),
-					"kind", patchOp.Target.Kind)
+					"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name),
+					"kind", target.Kind)
 				// Continue with other patches, but record the error
 				// TODO: Consider how to handle partial failures
 				continue
 			}
 			logger.Info("Successfully applied patch to target",
-				"target", fmt.Sprintf("%s/%s", patchOp.Target.Namespace, patchOp.Target.Name),
-				"kind", patchOp.Target.Kind,
-				"patchPath", patchOp.Target.PatchField.Path)
+				"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name),
+				"kind", target.Kind,
+				"patchPath", target.PatchField.Path)
 		}
 
 		// Update tracking status after successful patch
@@ -222,15 +206,15 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 	return nil
 }
 
-// getPatchOperations determines which targets need patching based on secret changes
-// Returns a list of PatchOperations, each containing the target and the secrets that changed
-func (r *PatchTrackerReconciler) getPatchOperations(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker) ([]PatchOperation, error) {
+// getTargetsToPatch determines which targets need patching based on secret changes
+// Returns a list of TargetRefs for targets whose secrets have changed
+func (r *PatchTrackerReconciler) getTargetsToPatch(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker) ([]resourcepatchv1alpha1.TargetRef, error) {
 	logger := logf.FromContext(ctx)
-	var patchOps []PatchOperation
+	var targetsToPatch []resourcepatchv1alpha1.TargetRef
 
 	// Iterate through targets list
 	for _, target := range patchTracker.Spec.Targets {
-		var changedSecrets []SecretChange
+		needsPatch := false
 
 		// Iterate through secret dependencies of target
 		for _, secretDep := range target.SecretDeps {
@@ -273,42 +257,34 @@ func (r *PatchTrackerReconciler) getPatchOperations(ctx context.Context, patchTr
 				lastKnownVersion, exists := patchTracker.Status.SecretVersions[secretKey]
 
 				if !exists || lastKnownVersion != currentVersion {
-					logger.Info("Secret version changed, adding to patch operation",
+					logger.Info("Secret version changed, target needs patching",
 						"secret", secretKey,
 						"currentVersion", currentVersion,
 						"lastKnownVersion", lastKnownVersion)
-					changedSecrets = append(changedSecrets, SecretChange{
-						Name:            secretName,
-						Namespace:       secretNamespace,
-						ResourceVersion: currentVersion,
-						Data:            secret.Data,
-					})
+					needsPatch = true
+					break // No need to check other secrets for this target
 				}
 			} else {
 				logger.V(1).Info("Skipping unwatched secret", "secret", secretName, "namespace", secretNamespace)
 			}
 		}
 
-		// If any secrets changed for this target, add it to the patch operations
-		if len(changedSecrets) > 0 {
-			patchOps = append(patchOps, PatchOperation{
-				Target:         target,
-				ChangedSecrets: changedSecrets,
-			})
+		// If any secrets changed for this target, add it to the list
+		if needsPatch {
+			targetsToPatch = append(targetsToPatch, target)
 		}
 	}
 
-	if len(patchOps) == 0 {
+	if len(targetsToPatch) == 0 {
 		logger.Info("No secret changes detected, skipping patch")
 	}
 
-	return patchOps, nil
+	return targetsToPatch, nil
 }
 
 // applyPatchToTarget applies the patch to the target resource using a dynamic client
-func (r *PatchTrackerReconciler) applyPatchToTarget(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker, patchOp PatchOperation) error {
+func (r *PatchTrackerReconciler) applyPatchToTarget(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker, target resourcepatchv1alpha1.TargetRef) error {
 	logger := logf.FromContext(ctx)
-	target := patchOp.Target
 
 	// Parse the apiVersion to get group and version
 	gv, err := schema.ParseGroupVersion(target.APIVersion)
@@ -347,14 +323,11 @@ func (r *PatchTrackerReconciler) applyPatchToTarget(ctx context.Context, patchTr
 		return fmt.Errorf("failed to get target resource: %w", err)
 	}
 
-	// Build the patch value from the changed secrets
-	patchValue, err := r.buildPatchValue(patchOp.ChangedSecrets)
-	if err != nil {
-		return fmt.Errorf("failed to build patch value: %w", err)
-	}
+	// Build the patch value (timestamp annotation to trigger rollout)
+	patchValue := r.buildPatchValue()
 
-	// Apply the patch based on the strategy
-	switch patchTracker.Spec.PatchStrategy {
+	// Apply the patch based on the target's strategy
+	switch target.PatchStrategy {
 	case "none":
 		logger.Info("PatchStrategy is 'none', skipping actual patch application")
 		return nil
@@ -365,26 +338,15 @@ func (r *PatchTrackerReconciler) applyPatchToTarget(ctx context.Context, patchTr
 	case "serverSideApply":
 		return r.applyServerSideApply(ctx, obj, target.PatchField.Path, patchValue, patchTracker.Name)
 	default:
-		return fmt.Errorf("unknown patch strategy: %s", patchTracker.Spec.PatchStrategy)
+		return fmt.Errorf("unknown patch strategy: %s", target.PatchStrategy)
 	}
 }
 
-// buildPatchValue constructs the value to patch from the changed secrets
-// For annotation paths, it creates annotations that can trigger rollouts
-// For other paths, it returns the secret data as a map
-func (r *PatchTrackerReconciler) buildPatchValue(changedSecrets []SecretChange) (interface{}, error) {
-	result := make(map[string]interface{})
-
-	// Add a timestamp annotation to trigger rollouts
-	result["resourcepatch.io/last-updated"] = time.Now().Format(time.RFC3339)
-
-	// Add version info for each secret that changed
-	for _, secret := range changedSecrets {
-		annotationKey := fmt.Sprintf("resourcepatch.io/secret-%s-version", secret.Name)
-		result[annotationKey] = secret.ResourceVersion
+// buildPatchValue constructs the annotation value to trigger rollouts
+func (r *PatchTrackerReconciler) buildPatchValue() map[string]interface{} {
+	return map[string]interface{}{
+		"resourcepatch.io/last-updated": time.Now().Format(time.RFC3339),
 	}
-
-	return result, nil
 }
 
 // setNestedField sets a value at a nested path in an unstructured object
