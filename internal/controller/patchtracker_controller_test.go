@@ -61,6 +61,7 @@ var _ = Describe("PatchTracker Controller", func() {
 								PatchField: resourcepatchv1alpha1.PatchField{
 									Path: "spec.replicas",
 								},
+								PatchStrategy: "strategicMerge",
 								SecretDeps: []resourcepatchv1alpha1.SecretRef{
 									{
 										Name:      "test-secret",
@@ -71,7 +72,6 @@ var _ = Describe("PatchTracker Controller", func() {
 								},
 							},
 						},
-						PatchStrategy:       "strategicMerge",
 						IgnoreMissingTarget: true,
 					},
 				}
