@@ -263,8 +263,14 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 	}
 
 	// Update Ready condition based on target statuses
-	readyCondition := r.computeReadyCondition(statusPatch.Status.Targets)
+	readyCondition := r.computeReadyCondition(statusPatch.Status.Targets, statusPatch.Generation)
 	if r.setCondition(&statusPatch.Status, readyCondition) {
+		updated = true
+	}
+
+	// Update ObservedGeneration to reflect the current generation
+	if statusPatch.Status.ObservedGeneration != statusPatch.Generation {
+		statusPatch.Status.ObservedGeneration = statusPatch.Generation
 		updated = true
 	}
 
@@ -285,14 +291,14 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 }
 
 // computeReadyCondition calculates the Ready condition based on target statuses
-func (r *PatchTrackerReconciler) computeReadyCondition(targets []resourcepatchv1alpha1.TargetStatus) metav1.Condition {
+func (r *PatchTrackerReconciler) computeReadyCondition(targets []resourcepatchv1alpha1.TargetStatus, observedGeneration int64) metav1.Condition {
 	now := metav1.Now()
 
 	if len(targets) == 0 {
 		return metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionTrue,
-			ObservedGeneration: 0,
+			ObservedGeneration: observedGeneration,
 			LastTransitionTime: now,
 			Reason:             "NoTargets",
 			Message:            "No targets have been processed yet",
@@ -311,7 +317,7 @@ func (r *PatchTrackerReconciler) computeReadyCondition(targets []resourcepatchv1
 		return metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionTrue,
-			ObservedGeneration: 0,
+			ObservedGeneration: observedGeneration,
 			LastTransitionTime: now,
 			Reason:             "AllTargetsHealthy",
 			Message:            fmt.Sprintf("All %d target(s) successfully patched", len(targets)),
@@ -322,7 +328,7 @@ func (r *PatchTrackerReconciler) computeReadyCondition(targets []resourcepatchv1
 		return metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,
-			ObservedGeneration: 0,
+			ObservedGeneration: observedGeneration,
 			LastTransitionTime: now,
 			Reason:             "AllTargetsFailed",
 			Message:            fmt.Sprintf("All %d target(s) failed to patch", len(targets)),
@@ -332,7 +338,7 @@ func (r *PatchTrackerReconciler) computeReadyCondition(targets []resourcepatchv1
 	return metav1.Condition{
 		Type:               "Ready",
 		Status:             metav1.ConditionFalse,
-		ObservedGeneration: 0,
+		ObservedGeneration: observedGeneration,
 		LastTransitionTime: now,
 		Reason:             "PartialFailure",
 		Message:            fmt.Sprintf("%d of %d target(s) failed to patch: %s", len(failedTargets), len(targets), strings.Join(failedTargets, ", ")),
