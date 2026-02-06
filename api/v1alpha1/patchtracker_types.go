@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -64,6 +65,22 @@ type PatchField struct {
 	// Path is the string path to the field to patch (e.g. "spec.replicas").
 	// +kubebuilder:validation:Required
 	Path string `json:"path"`
+
+	// Method determines how the patch value is generated.
+	// Allowed values: "timestamp", "specific", "randomString", "increasingInteger".
+	// +kubebuilder:validation:Enum=timestamp;specific;randomString;increasingInteger
+	// +kubebuilder:default="timestamp"
+	Method string `json:"method,omitempty"`
+
+	// SpecificValue is used when Method is "specific". Can be any JSON value.
+	// +optional
+	SpecificValue *apiextensionsv1.JSON `json:"specificValue,omitempty"`
+
+	// RandomStringLength specifies the length for randomString method.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=256
+	// +kubebuilder:default=32
+	RandomStringLength int `json:"randomStringLength,omitempty"`
 }
 
 // SecretRef identifies Secret dependencies which can trigger reconciles.

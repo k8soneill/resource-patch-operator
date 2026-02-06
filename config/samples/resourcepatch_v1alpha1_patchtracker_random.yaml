@@ -1,0 +1,19 @@
+apiVersion: resourcepatch.io.github.k8soneill/v1alpha1
+kind: PatchTracker
+metadata:
+  name: patchtracker-random
+  namespace: default
+spec:
+  targets:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: sample-deployment
+      namespace: default
+      patchField:
+        path: "metadata.annotations.restart-id"
+        method: randomString
+        randomStringLength: 32
+      patchStrategy: "strategicMerge"
+      secretDeps:
+        - name: sample-config-secret
+          watch: true

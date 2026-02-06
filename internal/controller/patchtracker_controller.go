@@ -20,6 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -323,8 +326,24 @@ func (r *PatchTrackerReconciler) applyPatchToTarget(ctx context.Context, patchTr
 		return fmt.Errorf("failed to get target resource: %w", err)
 	}
 
-	// Build the patch value (timestamp annotation to trigger rollout)
-	patchValue := r.buildPatchValue()
+	// Build the patch value based on the configured method
+	patchValue, err := r.buildPatchValue(ctx, obj, target.PatchField)
+	if err != nil {
+		return fmt.Errorf("failed to build patch value: %w", err)
+	}
+
+	// Convert integers to strings when patching annotations
+	// Kubernetes annotations must be strings, not numbers
+	if strings.Contains(target.PatchField.Path, "annotations") {
+		switch v := patchValue.(type) {
+		case int64:
+			patchValue = strconv.FormatInt(v, 10)
+		case int:
+			patchValue = strconv.Itoa(v)
+		case int32:
+			patchValue = strconv.FormatInt(int64(v), 10)
+		}
+	}
 
 	// Apply the patch based on the target's strategy
 	switch target.PatchStrategy {
@@ -342,11 +361,113 @@ func (r *PatchTrackerReconciler) applyPatchToTarget(ctx context.Context, patchTr
 	}
 }
 
-// buildPatchValue constructs the annotation value to trigger rollouts
-func (r *PatchTrackerReconciler) buildPatchValue() map[string]interface{} {
+// buildPatchValue constructs the value to patch based on the method
+func (r *PatchTrackerReconciler) buildPatchValue(
+	ctx context.Context,
+	obj *unstructured.Unstructured,
+	patchField resourcepatchv1alpha1.PatchField,
+) (interface{}, error) {
+	method := patchField.Method
+	if method == "" {
+		method = "timestamp" // default for backward compatibility
+	}
+
+	switch method {
+	case "timestamp":
+		return r.buildTimestampValue(), nil
+	case "specific":
+		if patchField.SpecificValue == nil {
+			return nil, fmt.Errorf("specificValue is required when method is 'specific'")
+		}
+		var value interface{}
+		if err := json.Unmarshal(patchField.SpecificValue.Raw, &value); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal specificValue: %w", err)
+		}
+		return value, nil
+	case "randomString":
+		length := patchField.RandomStringLength
+		if length == 0 {
+			length = 32
+		}
+		return r.buildRandomStringValue(length), nil
+	case "increasingInteger":
+		return r.buildIncreasingIntegerValue(ctx, obj, patchField.Path)
+	default:
+		return nil, fmt.Errorf("unknown patch method: %s", method)
+	}
+}
+
+// buildTimestampValue creates a timestamp annotation (legacy default behavior)
+func (r *PatchTrackerReconciler) buildTimestampValue() interface{} {
 	return map[string]interface{}{
 		"resourcepatch.io/last-updated": time.Now().Format(time.RFC3339),
 	}
+}
+
+// buildRandomStringValue generates a random alphanumeric string
+func (r *PatchTrackerReconciler) buildRandomStringValue(length int) interface{} {
+	seed := time.Now().UnixNano()
+
+	// Allow deterministic testing via environment variable
+	if seedStr := os.Getenv("PATCH_RANDOM_SEED"); seedStr != "" {
+		if s, err := strconv.ParseInt(seedStr, 10, 64); err == nil {
+			seed = s
+		}
+	}
+
+	rng := rand.New(rand.NewSource(seed))
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+	result := make([]byte, length)
+	for i := range result {
+		result[i] = charset[rng.Intn(len(charset))]
+	}
+
+	return string(result)
+}
+
+// buildIncreasingIntegerValue reads the current field and increments by 1
+func (r *PatchTrackerReconciler) buildIncreasingIntegerValue(
+	ctx context.Context,
+	obj *unstructured.Unstructured,
+	path string,
+) (interface{}, error) {
+	logger := logf.FromContext(ctx)
+
+	// Get current value at path
+	currentValue, found, err := unstructured.NestedFieldCopy(obj.Object, strings.Split(path, ".")...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read field at path %q: %w", path, err)
+	}
+
+	if !found {
+		logger.Info("Field not found, starting from 0", "path", path)
+		return int64(0), nil
+	}
+
+	// Try to convert to int64
+	var currentInt int64
+	switch v := currentValue.(type) {
+	case int64:
+		currentInt = v
+	case int:
+		currentInt = int64(v)
+	case int32:
+		currentInt = int64(v)
+	case float64:
+		currentInt = int64(v)
+		logger.Info("Converting float to int", "path", path, "float", v, "int", currentInt)
+	case string:
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("field at path %q contains string %q which is not a valid integer", path, v)
+		}
+		currentInt = parsed
+	default:
+		return nil, fmt.Errorf("field at path %q has type %T, expected integer", path, v)
+	}
+
+	return currentInt + 1, nil
 }
 
 // setNestedField sets a value at a nested path in an unstructured object

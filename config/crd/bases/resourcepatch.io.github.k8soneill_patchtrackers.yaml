@@ -131,10 +131,32 @@ spec:
                       description: PatchField describes a single field to patch on
                         the target resource
                       properties:
+                        method:
+                          default: timestamp
+                          description: |-
+                            Method determines how the patch value is generated.
+                            Allowed values: "timestamp", "specific", "randomString", "increasingInteger".
+                          enum:
+                          - timestamp
+                          - specific
+                          - randomString
+                          - increasingInteger
+                          type: string
                         path:
                           description: Path is the string path to the field to patch
                             (e.g. "spec.replicas").
                           type: string
+                        randomStringLength:
+                          default: 32
+                          description: RandomStringLength specifies the length for
+                            randomString method.
+                          maximum: 256
+                          minimum: 1
+                          type: integer
+                        specificValue:
+                          description: SpecificValue is used when Method is "specific".
+                            Can be any JSON value.
+                          x-kubernetes-preserve-unknown-fields: true
                       required:
                       - path
                       type: object

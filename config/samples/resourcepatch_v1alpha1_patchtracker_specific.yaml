@@ -1,0 +1,19 @@
+apiVersion: resourcepatch.io.github.k8soneill/v1alpha1
+kind: PatchTracker
+metadata:
+  name: patchtracker-specific
+  namespace: default
+spec:
+  targets:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: sample-deployment
+      namespace: default
+      patchField:
+        path: "spec.replicas"
+        method: specific
+        specificValue: 5
+      patchStrategy: "strategicMerge"
+      secretDeps:
+        - name: sample-config-secret
+          watch: true
