@@ -301,7 +301,7 @@ var _ = Describe("PatchTracker Controller", func() {
 			By("Verifying PatchTracker status has updated secret version")
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{}
 			Expect(k8sClient.Get(ctx, patchTrackerKey, patchTracker)).To(Succeed())
-			Expect(len(patchTracker.Status.Targets)).To(BeNumerically(">", 0))
+			Expect(patchTracker.Status.Targets).NotTo(BeEmpty())
 			secretVersionKey := namespace + "/" + secretName
 			Expect(patchTracker.Status.Targets[0].SecretVersions[secretVersionKey]).To(Equal(secret.ResourceVersion))
 		})
