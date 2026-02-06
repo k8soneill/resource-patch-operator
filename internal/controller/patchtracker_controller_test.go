@@ -29,10 +29,27 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	resourcepatchv1alpha1 "github.com/k8soneill/resource-patch-operator/api/v1alpha1"
 )
+
+// cleanupPatchTracker deletes a PatchTracker, reconciles to process finalizer removal,
+// and validates the object is fully deleted
+func cleanupPatchTracker(ctx context.Context, reconciler *PatchTrackerReconciler, k8sClient client.Client, key types.NamespacedName) {
+	patchTracker := &resourcepatchv1alpha1.PatchTracker{}
+	if err := k8sClient.Get(ctx, key, patchTracker); err == nil {
+		Expect(k8sClient.Delete(ctx, patchTracker)).To(Succeed())
+		// Reconcile to process finalizer removal
+		_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		// Validate the object is gone
+		Eventually(func() bool {
+			err := k8sClient.Get(ctx, key, patchTracker)
+			return err != nil
+		}, "10s", "500ms").Should(BeTrue(), "PatchTracker should be fully deleted after finalizer removal")
+	}
+}
 
 var _ = Describe("PatchTracker Controller", func() {
 	Context("When reconciling with secret version tracking", func() {
@@ -140,10 +157,7 @@ var _ = Describe("PatchTracker Controller", func() {
 
 		AfterEach(func() {
 			// Cleanup resources
-			patchTracker := &resourcepatchv1alpha1.PatchTracker{}
-			if err := k8sClient.Get(ctx, patchTrackerKey, patchTracker); err == nil {
-				Expect(k8sClient.Delete(ctx, patchTracker)).To(Succeed())
-			}
+			cleanupPatchTracker(ctx, reconciler, k8sClient, patchTrackerKey)
 
 			deployment := &appsv1.Deployment{}
 			if err := k8sClient.Get(ctx, deploymentKey, deployment); err == nil {
@@ -456,7 +470,10 @@ var _ = Describe("PatchTracker Controller", func() {
 			}
 
 			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, patchTracker) }()
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
 
 			By("Reconciling PatchTracker")
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
@@ -513,7 +530,10 @@ var _ = Describe("PatchTracker Controller", func() {
 			}
 
 			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, patchTracker) }()
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
 
 			By("Reconciling PatchTracker")
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
@@ -533,6 +553,65 @@ var _ = Describe("PatchTracker Controller", func() {
 				}
 				return deployment.Annotations["custom-key"]
 			}, "10s", "1s").Should(Equal("custom-annotation-value"))
+		})
+
+		It("should normalize float64 to int64 for whole numbers", func() {
+			// JSON unmarshaling produces float64 for numbers, but we normalize to int64
+			// when there's no fractional part (5.0 → 5)
+			specificValue := 3 // Will be marshaled to JSON as 3, unmarshaled as float64(3)
+			rawValue, _ := json.Marshal(specificValue)
+
+			patchTrackerName := "test-float-normalize-" + time.Now().Format("150405")
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					Targets: []resourcepatchv1alpha1.TargetRef{{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       deploymentName,
+						Namespace:  namespace,
+						PatchField: resourcepatchv1alpha1.PatchField{
+							Path:          "spec.replicas",
+							Method:        "specific",
+							SpecificValue: &apiextensionsv1.JSON{Raw: rawValue},
+						},
+						PatchStrategy: "strategicMerge",
+						SecretDeps: []resourcepatchv1alpha1.SecretRef{{
+							Name:      secretName,
+							Namespace: namespace,
+							Watch:     true,
+						}},
+					}},
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
+
+			By("Reconciling PatchTracker")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying replicas set to integer value (float64 normalized to int64)")
+			Eventually(func() int32 {
+				deployment := &appsv1.Deployment{}
+				err := k8sClient.Get(ctx, deploymentKey, deployment)
+				if err != nil || deployment.Spec.Replicas == nil {
+					return -1
+				}
+				return *deployment.Spec.Replicas
+			}, "10s", "1s").Should(Equal(int32(3)))
 		})
 
 		It("should generate random string with deterministic seed", func() {
@@ -567,9 +646,12 @@ var _ = Describe("PatchTracker Controller", func() {
 			}
 
 			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, patchTracker) }()
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
 
-			By("Reconciling PatchTracker")
+			By("Reconciling PatchTracker for first time")
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      patchTrackerName,
@@ -578,7 +660,7 @@ var _ = Describe("PatchTracker Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Verifying random string was generated with correct length")
+			By("Capturing the first generated value")
 			var firstValue string
 			Eventually(func() int {
 				deployment := &appsv1.Deployment{}
@@ -589,9 +671,33 @@ var _ = Describe("PatchTracker Controller", func() {
 				firstValue = deployment.Annotations["random-id"]
 				return len(firstValue)
 			}, "10s", "1s").Should(Equal(16))
-
-			By("Verifying string is deterministic with same seed")
 			Expect(firstValue).NotTo(BeEmpty())
+
+			By("Updating secret to trigger another patch with same seed")
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, secretKey, secret)).To(Succeed())
+			secret.Data["key"] = []byte("updated-value")
+			Expect(k8sClient.Update(ctx, secret)).To(Succeed())
+
+			By("Reconciling PatchTracker again with same seed")
+			time.Sleep(1 * time.Second)
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the same deterministic value is generated")
+			Eventually(func() string {
+				deployment := &appsv1.Deployment{}
+				err := k8sClient.Get(ctx, deploymentKey, deployment)
+				if err != nil {
+					return ""
+				}
+				return deployment.Annotations["random-id"]
+			}, "10s", "1s").Should(Equal(firstValue), "Same seed should produce identical random string")
 		})
 
 		It("should increment integer field", func() {
@@ -622,7 +728,10 @@ var _ = Describe("PatchTracker Controller", func() {
 			}
 
 			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, patchTracker) }()
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
 
 			By("Getting initial replicas count")
 			deployment := &appsv1.Deployment{}
@@ -677,7 +786,10 @@ var _ = Describe("PatchTracker Controller", func() {
 			}
 
 			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, patchTracker) }()
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
 
 			By("Reconciling PatchTracker")
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
@@ -735,7 +847,10 @@ var _ = Describe("PatchTracker Controller", func() {
 			}
 
 			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, patchTracker) }()
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
 
 			By("Reconciling PatchTracker - error is logged but not returned (partial failure handling)")
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
@@ -786,7 +901,10 @@ var _ = Describe("PatchTracker Controller", func() {
 			}
 
 			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, patchTracker) }()
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
 
 			By("Reconciling - error is logged but not returned (partial failure handling)")
 			initialReplicas := int32(1)
@@ -832,7 +950,10 @@ var _ = Describe("PatchTracker Controller", func() {
 			}
 
 			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, patchTracker) }()
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
 
 			By("Reconciling PatchTracker")
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
@@ -891,7 +1012,10 @@ var _ = Describe("PatchTracker Controller", func() {
 			}
 
 			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, patchTracker) }()
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
 
 			By("Reconciling PatchTracker")
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
@@ -942,7 +1066,10 @@ var _ = Describe("PatchTracker Controller", func() {
 			}
 
 			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
-			defer func() { _ = k8sClient.Delete(ctx, patchTracker) }()
+			defer cleanupPatchTracker(ctx, reconciler, k8sClient, types.NamespacedName{
+				Name:      patchTrackerName,
+				Namespace: namespace,
+			})
 
 			By("Reconciling PatchTracker")
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{

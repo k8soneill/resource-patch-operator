@@ -332,19 +332,6 @@ func (r *PatchTrackerReconciler) applyPatchToTarget(ctx context.Context, patchTr
 		return fmt.Errorf("failed to build patch value: %w", err)
 	}
 
-	// Convert integers to strings when patching annotations
-	// Kubernetes annotations must be strings, not numbers
-	if strings.Contains(target.PatchField.Path, "annotations") {
-		switch v := patchValue.(type) {
-		case int64:
-			patchValue = strconv.FormatInt(v, 10)
-		case int:
-			patchValue = strconv.Itoa(v)
-		case int32:
-			patchValue = strconv.FormatInt(int64(v), 10)
-		}
-	}
-
 	// Apply the patch based on the target's strategy
 	switch target.PatchStrategy {
 	case "none":
@@ -382,6 +369,11 @@ func (r *PatchTrackerReconciler) buildPatchValue(
 		var value interface{}
 		if err := json.Unmarshal(patchField.SpecificValue.Raw, &value); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal specificValue: %w", err)
+		}
+		// Normalize float64 to int64 when there's no fractional part
+		// This handles JSON unmarshaling producing float64 for all numbers
+		if f, ok := value.(float64); ok && f == float64(int64(f)) {
+			value = int64(f)
 		}
 		return value, nil
 	case "randomString":
@@ -441,12 +433,15 @@ func (r *PatchTrackerReconciler) buildIncreasingIntegerValue(
 	}
 
 	if !found {
-		logger.Info("Field not found, starting from 0", "path", path)
-		return int64(0), nil
+		logger.Info("Field not found, starting from 0 as string", "path", path)
+		// Default to string "0" since annotations/labels are the most common use case
+		return "0", nil
 	}
 
-	// Try to convert to int64
+	// Parse the current value and preserve its type
 	var currentInt int64
+	var wasString bool
+
 	switch v := currentValue.(type) {
 	case int64:
 		currentInt = v
@@ -463,11 +458,17 @@ func (r *PatchTrackerReconciler) buildIncreasingIntegerValue(
 			return nil, fmt.Errorf("field at path %q contains string %q which is not a valid integer", path, v)
 		}
 		currentInt = parsed
+		wasString = true
 	default:
-		return nil, fmt.Errorf("field at path %q has type %T, expected integer", path, v)
+		return nil, fmt.Errorf("field at path %q has type %T, expected integer or string", path, v)
 	}
 
-	return currentInt + 1, nil
+	// Return the incremented value in the same type as the input
+	newValue := currentInt + 1
+	if wasString {
+		return strconv.FormatInt(newValue, 10), nil
+	}
+	return newValue, nil
 }
 
 // setNestedField sets a value at a nested path in an unstructured object
