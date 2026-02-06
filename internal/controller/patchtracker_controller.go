@@ -109,7 +109,8 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Get list of targets that need patching based on secret changes
-	targetsToPatch, err := r.getTargetsToPatch(ctx, patchTracker)
+	// Also returns a cache of secret versions to avoid re-fetching in updateTrackingStatus
+	targetsToPatch, secretVersionCache, err := r.getTargetsToPatch(ctx, patchTracker)
 	if err != nil {
 		logger.Error(err, "Failed to determine targets to patch")
 		return ctrl.Result{}, err
@@ -139,8 +140,8 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				"patchPath", target.PatchField.Path)
 		}
 
-		// Update tracking status with per-target results
-		if err := r.updateTrackingStatus(ctx, patchTracker, results); err != nil {
+		// Update tracking status with per-target results and cached secret versions
+		if err := r.updateTrackingStatus(ctx, patchTracker, results, secretVersionCache); err != nil {
 			logger.Error(err, "Failed to update tracking status")
 			return ctrl.Result{}, err
 		}
@@ -151,7 +152,7 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, nil
 }
 
-func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker, results []targetResult) error {
+func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker, results []targetResult, secretVersionCache map[string]string) error {
 	logger := logf.FromContext(ctx)
 
 	// Get the latest version of the object to avoid conflicts
@@ -218,7 +219,7 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 				targetStatus.SecretVersions = make(map[string]string)
 			}
 
-			// Update secret versions for this target
+			// Update secret versions for this target using cache
 			for _, secretDep := range target.SecretDeps {
 				if secretDep.Watch {
 					secretName := secretDep.Name
@@ -227,38 +228,49 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 						secretNamespace = target.Namespace
 					}
 
-					// Fetch current secret version
-					secretNamespacedName := types.NamespacedName{
-						Name:      secretName,
-						Namespace: secretNamespace,
-					}
-					secret := &corev1.Secret{}
-					if err := r.Get(ctx, secretNamespacedName, secret); err != nil {
-						if !apierrors.IsNotFound(err) {
-							return err
+					secretKey := secretNamespace + "/" + secretName
+
+					// Try to get version from cache first
+					currentVersion, cached := secretVersionCache[secretKey]
+
+					if !cached {
+						// Fallback: fetch if not in cache (shouldn't happen in normal flow)
+						secretNamespacedName := types.NamespacedName{
+							Name:      secretName,
+							Namespace: secretNamespace,
 						}
-						// Secret not found, skip version tracking
-						continue
+						secret := &corev1.Secret{}
+						if err := r.Get(ctx, secretNamespacedName, secret); err != nil {
+							if !apierrors.IsNotFound(err) {
+								return err
+							}
+							// Secret not found, skip version tracking
+							continue
+						}
+						currentVersion = secret.ResourceVersion
+						// Add to cache for potential reuse
+						secretVersionCache[secretKey] = currentVersion
 					}
 
-					secretKey := secretNamespace + "/" + secretName
-					currentVersion := secret.ResourceVersion
 					if targetStatus.SecretVersions[secretKey] != currentVersion {
 						targetStatus.SecretVersions[secretKey] = currentVersion
-						updated = true
 					}
 				}
 			}
 
-			// Update success metadata
-			if targetStatus.LastError != "" || targetStatus.LastPatchTime == nil {
-				targetStatus.LastPatchTime = &now
+			// Always update LastPatchTime on successful patch
+			targetStatus.LastPatchTime = &now
+			updated = true
+
+			// Clear error fields if they were set
+			if targetStatus.LastError != "" || targetStatus.LastErrorTime != nil {
 				targetStatus.LastError = ""
 				targetStatus.LastErrorTime = nil
 				updated = true
-				logger.Info("Updated target status with success",
-					"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name))
 			}
+
+			logger.Info("Updated target status with success",
+				"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name))
 		}
 	}
 
@@ -376,10 +388,12 @@ func (r *PatchTrackerReconciler) setCondition(status *resourcepatchv1alpha1.Patc
 }
 
 // getTargetsToPatch determines which targets need patching based on secret changes
-// Returns a list of TargetRefs for targets whose secrets have changed
-func (r *PatchTrackerReconciler) getTargetsToPatch(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker) ([]resourcepatchv1alpha1.TargetRef, error) {
+// Returns a list of TargetRefs for targets whose secrets have changed and a cache of secret versions
+func (r *PatchTrackerReconciler) getTargetsToPatch(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker) ([]resourcepatchv1alpha1.TargetRef, map[string]string, error) {
 	logger := logf.FromContext(ctx)
 	var targetsToPatch []resourcepatchv1alpha1.TargetRef
+	// Cache secret versions to avoid re-fetching in updateTrackingStatus
+	secretVersionCache := make(map[string]string)
 
 	// Iterate through targets list
 	for _, target := range patchTracker.Spec.Targets {
@@ -424,27 +438,34 @@ func (r *PatchTrackerReconciler) getTargetsToPatch(ctx context.Context, patchTra
 					Name:      secretName,
 					Namespace: secretNamespace,
 				}
-				// Fetch the secret
-				secret := &corev1.Secret{}
-				if err := r.Get(ctx, secretNamespacedName, secret); err != nil {
-					// If not found and optional move on to next secret in the loop
-					if apierrors.IsNotFound(err) {
-						if secretDep.Optional {
-							logger.Info("Secret is missing but optional. Not erroring.", "secret", secretName, "namespace", secretNamespace)
-							continue
-						} else {
-							logger.Error(err, "Required secret not found", "secret", secretName, "namespace", secretNamespace)
-							return nil, err
+				// Check cache first to avoid re-fetching
+				secretKey := secretNamespace + "/" + secretName
+				currentVersion, cached := secretVersionCache[secretKey]
+
+				if !cached {
+					// Fetch the secret if not in cache
+					secret := &corev1.Secret{}
+					if err := r.Get(ctx, secretNamespacedName, secret); err != nil {
+						// If not found and optional move on to next secret in the loop
+						if apierrors.IsNotFound(err) {
+							if secretDep.Optional {
+								logger.Info("Secret is missing but optional. Not erroring.", "secret", secretName, "namespace", secretNamespace)
+								continue
+							} else {
+								logger.Error(err, "Required secret not found", "secret", secretName, "namespace", secretNamespace)
+								return nil, nil, err
+							}
 						}
+						// Other errors should be returned
+						logger.Error(err, "Failed to fetch secret", "secret", secretName, "namespace", secretNamespace)
+						return nil, nil, err
 					}
-					// Other errors should be returned
-					logger.Error(err, "Failed to fetch secret", "secret", secretName, "namespace", secretNamespace)
-					return nil, err
+					currentVersion = secret.ResourceVersion
+					// Cache the version for reuse
+					secretVersionCache[secretKey] = currentVersion
 				}
 
 				// Check if this secret version has changed for THIS target
-				secretKey := secretNamespace + "/" + secretName
-				currentVersion := secret.ResourceVersion
 				lastKnownVersion := targetStatus.SecretVersions[secretKey]
 
 				if lastKnownVersion != currentVersion {
@@ -471,7 +492,7 @@ func (r *PatchTrackerReconciler) getTargetsToPatch(ctx context.Context, patchTra
 		logger.Info("No secret changes detected, skipping patch")
 	}
 
-	return targetsToPatch, nil
+	return targetsToPatch, secretVersionCache, nil
 }
 
 // applyPatchToTarget applies the patch to the target resource using a dynamic client
@@ -640,8 +661,12 @@ func (r *PatchTrackerReconciler) buildIncreasingIntegerValue(
 	case int32:
 		currentInt = int64(v)
 	case float64:
+		// Reject non-whole floats to avoid silent truncation
+		if v != float64(int64(v)) {
+			return nil, fmt.Errorf("field at path %q contains float %v with fractional part, cannot increment as integer (would lose precision)", path, v)
+		}
 		currentInt = int64(v)
-		logger.Info("Converting float to int", "path", path, "float", v, "int", currentInt)
+		logger.Info("Converting whole-number float to int", "path", path, "float", v, "int", currentInt)
 	case string:
 		parsed, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
