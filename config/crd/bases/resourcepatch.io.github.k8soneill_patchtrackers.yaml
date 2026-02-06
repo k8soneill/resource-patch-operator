@@ -268,11 +268,6 @@ spec:
                   - type
                   type: object
                 type: array
-              lastPatchTime:
-                description: LastPatchTime tracks when patches were last applied to
-                  targets
-                format: date-time
-                type: string
               lastReconcileTime:
                 description: LastReconcileTime is the time the controller last completed
                   a reconcile.
@@ -283,33 +278,48 @@ spec:
                   by the controller.
                 format: int64
                 type: integer
-              secretVersions:
-                additionalProperties:
-                  type: string
+              targets:
                 description: |-
-                  SecretVersions tracks the resourceVersion of each watched secret
-                  Key: "namespace/secretname", Value: resourceVersion
-                type: object
-              trackedResources:
-                description: TrackedResources lists resources that this PatchTracker
-                  is observing.
+                  Targets tracks the status of each target independently.
+                  This provides per-target secret version tracking and error reporting.
                 items:
-                  description: TrackedResource records an observed resource and its
-                    last seen state.
+                  description: TargetStatus tracks the state of a single target resource.
                   properties:
                     apiVersion:
+                      description: Reference to the target resource
                       type: string
                     kind:
                       type: string
-                    lastSeen:
+                    lastError:
+                      description: |-
+                        LastError contains the error message from the most recent patch attempt.
+                        Empty string indicates success.
+                      type: string
+                    lastErrorTime:
+                      description: LastErrorTime is when the last error occurred.
+                      format: date-time
+                      type: string
+                    lastPatchTime:
+                      description: LastPatchTime is when this target was last successfully
+                        patched.
                       format: date-time
                       type: string
                     name:
                       type: string
                     namespace:
                       type: string
-                    resourceVersion:
-                      type: string
+                    secretVersions:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        SecretVersions tracks the last successfully processed version of each secret for this target.
+                        Key: "namespace/secretname", Value: resourceVersion
+                      type: object
+                  required:
+                  - apiVersion
+                  - kind
+                  - name
+                  - namespace
                   type: object
                 type: array
             type: object

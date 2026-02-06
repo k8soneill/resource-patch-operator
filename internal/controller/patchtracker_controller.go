@@ -49,6 +49,12 @@ type PatchTrackerReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+// targetResult tracks the outcome of patching a single target
+type targetResult struct {
+	target resourcepatchv1alpha1.TargetRef
+	err    error
+}
+
 // +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=resourcepatch.io.github.k8soneill,resources=patchtrackers/finalizers,verbs=update
@@ -112,14 +118,19 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if len(targetsToPatch) > 0 {
 		logger.Info("Applying patches due to secret changes", "targetCount", len(targetsToPatch))
 
+		// Track results per target
+		results := make([]targetResult, 0, len(targetsToPatch))
+
 		// Apply patch to each target
 		for _, target := range targetsToPatch {
-			if err := r.applyPatchToTarget(ctx, patchTracker, target); err != nil {
+			err := r.applyPatchToTarget(ctx, patchTracker, target)
+			results = append(results, targetResult{target: target, err: err})
+
+			if err != nil {
 				logger.Error(err, "Failed to apply patch to target",
 					"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name),
 					"kind", target.Kind)
-				// Continue with other patches, but record the error
-				// TODO: Consider how to handle partial failures
+				// Continue with other patches
 				continue
 			}
 			logger.Info("Successfully applied patch to target",
@@ -128,8 +139,8 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				"patchPath", target.PatchField.Path)
 		}
 
-		// Update tracking status after successful patch
-		if err := r.updateTrackingStatus(ctx, patchTracker); err != nil {
+		// Update tracking status with per-target results
+		if err := r.updateTrackingStatus(ctx, patchTracker, results); err != nil {
 			logger.Error(err, "Failed to update tracking status")
 			return ctrl.Result{}, err
 		}
@@ -140,7 +151,7 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{}, nil
 }
 
-func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker) error {
+func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker, results []targetResult) error {
 	logger := logf.FromContext(ctx)
 
 	// Get the latest version of the object to avoid conflicts
@@ -151,50 +162,114 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 
 	statusPatch := latest.DeepCopy()
 
-	// Initialize status fields if needed
-	if statusPatch.Status.SecretVersions == nil {
-		statusPatch.Status.SecretVersions = make(map[string]string)
+	// Initialize Targets slice if needed
+	if statusPatch.Status.Targets == nil {
+		statusPatch.Status.Targets = make([]resourcepatchv1alpha1.TargetStatus, 0)
 	}
 
-	// Update secret versions based on current state
+	now := metav1.Now()
 	updated := false
-	for _, target := range patchTracker.Spec.Targets {
-		for _, secretDep := range target.SecretDeps {
-			if secretDep.Watch {
-				secretName := secretDep.Name
-				secretNamespace := secretDep.Namespace
-				if secretNamespace == "" {
-					secretNamespace = target.Namespace
-				}
 
-				// Fetch current secret version
-				secretNamespacedName := types.NamespacedName{
-					Name:      secretName,
-					Namespace: secretNamespace,
-				}
-				secret := &corev1.Secret{}
-				if err := r.Get(ctx, secretNamespacedName, secret); err != nil {
-					if !apierrors.IsNotFound(err) {
-						return err
+	// Process each target result
+	for _, result := range results {
+		target := result.target
+
+		// Find or create the TargetStatus for this target
+		var targetStatus *resourcepatchv1alpha1.TargetStatus
+		for i := range statusPatch.Status.Targets {
+			ts := &statusPatch.Status.Targets[i]
+			if ts.APIVersion == target.APIVersion &&
+				ts.Kind == target.Kind &&
+				ts.Name == target.Name &&
+				ts.Namespace == target.Namespace {
+				targetStatus = ts
+				break
+			}
+		}
+
+		// Create new TargetStatus if it doesn't exist
+		if targetStatus == nil {
+			newStatus := resourcepatchv1alpha1.TargetStatus{
+				APIVersion:     target.APIVersion,
+				Kind:           target.Kind,
+				Name:           target.Name,
+				Namespace:      target.Namespace,
+				SecretVersions: make(map[string]string),
+			}
+			statusPatch.Status.Targets = append(statusPatch.Status.Targets, newStatus)
+			targetStatus = &statusPatch.Status.Targets[len(statusPatch.Status.Targets)-1]
+			updated = true
+		}
+
+		// Update the target status based on patch result
+		if result.err != nil {
+			// Patch failed - record error but don't update secret versions
+			if targetStatus.LastError != result.err.Error() {
+				targetStatus.LastError = result.err.Error()
+				targetStatus.LastErrorTime = &now
+				updated = true
+				logger.Info("Updated target status with error",
+					"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name),
+					"error", result.err.Error())
+			}
+		} else {
+			// Patch succeeded - update secret versions and clear error
+			if targetStatus.SecretVersions == nil {
+				targetStatus.SecretVersions = make(map[string]string)
+			}
+
+			// Update secret versions for this target
+			for _, secretDep := range target.SecretDeps {
+				if secretDep.Watch {
+					secretName := secretDep.Name
+					secretNamespace := secretDep.Namespace
+					if secretNamespace == "" {
+						secretNamespace = target.Namespace
 					}
-					// Secret not found, skip version tracking
-					continue
-				}
 
-				secretKey := secretNamespace + "/" + secretName
-				currentVersion := secret.ResourceVersion
-				if statusPatch.Status.SecretVersions[secretKey] != currentVersion {
-					statusPatch.Status.SecretVersions[secretKey] = currentVersion
-					updated = true
+					// Fetch current secret version
+					secretNamespacedName := types.NamespacedName{
+						Name:      secretName,
+						Namespace: secretNamespace,
+					}
+					secret := &corev1.Secret{}
+					if err := r.Get(ctx, secretNamespacedName, secret); err != nil {
+						if !apierrors.IsNotFound(err) {
+							return err
+						}
+						// Secret not found, skip version tracking
+						continue
+					}
+
+					secretKey := secretNamespace + "/" + secretName
+					currentVersion := secret.ResourceVersion
+					if targetStatus.SecretVersions[secretKey] != currentVersion {
+						targetStatus.SecretVersions[secretKey] = currentVersion
+						updated = true
+					}
 				}
+			}
+
+			// Update success metadata
+			if targetStatus.LastError != "" || targetStatus.LastPatchTime == nil {
+				targetStatus.LastPatchTime = &now
+				targetStatus.LastError = ""
+				targetStatus.LastErrorTime = nil
+				updated = true
+				logger.Info("Updated target status with success",
+					"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name))
 			}
 		}
 	}
 
+	// Update Ready condition based on target statuses
+	readyCondition := r.computeReadyCondition(statusPatch.Status.Targets)
+	if r.setCondition(&statusPatch.Status, readyCondition) {
+		updated = true
+	}
+
 	// Only update if something changed
 	if updated {
-		statusPatch.Status.LastPatchTime = &metav1.Time{Time: time.Now()}
-
 		if err := r.Status().Update(ctx, statusPatch); err != nil {
 			if apierrors.IsConflict(err) {
 				logger.Info("Status update conflict, will retry on next reconcile", "error", err.Error())
@@ -203,10 +278,95 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 			logger.Error(err, "Failed to update PatchTracker status")
 			return err
 		}
-		logger.Info("Updated PatchTracker status with new secret versions")
+		logger.Info("Updated PatchTracker status with per-target results")
 	}
 
 	return nil
+}
+
+// computeReadyCondition calculates the Ready condition based on target statuses
+func (r *PatchTrackerReconciler) computeReadyCondition(targets []resourcepatchv1alpha1.TargetStatus) metav1.Condition {
+	now := metav1.Now()
+
+	if len(targets) == 0 {
+		return metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: 0,
+			LastTransitionTime: now,
+			Reason:             "NoTargets",
+			Message:            "No targets have been processed yet",
+		}
+	}
+
+	// Count targets with errors
+	var failedTargets []string
+	for _, target := range targets {
+		if target.LastError != "" {
+			failedTargets = append(failedTargets, fmt.Sprintf("%s/%s", target.Namespace, target.Name))
+		}
+	}
+
+	if len(failedTargets) == 0 {
+		return metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: 0,
+			LastTransitionTime: now,
+			Reason:             "AllTargetsHealthy",
+			Message:            fmt.Sprintf("All %d target(s) successfully patched", len(targets)),
+		}
+	}
+
+	if len(failedTargets) == len(targets) {
+		return metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: 0,
+			LastTransitionTime: now,
+			Reason:             "AllTargetsFailed",
+			Message:            fmt.Sprintf("All %d target(s) failed to patch", len(targets)),
+		}
+	}
+
+	return metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: 0,
+		LastTransitionTime: now,
+		Reason:             "PartialFailure",
+		Message:            fmt.Sprintf("%d of %d target(s) failed to patch: %s", len(failedTargets), len(targets), strings.Join(failedTargets, ", ")),
+	}
+}
+
+// setCondition updates or adds a condition to the status, preserving LastTransitionTime if status hasn't changed
+// Returns true if the condition was updated
+func (r *PatchTrackerReconciler) setCondition(status *resourcepatchv1alpha1.PatchTrackerStatus, newCondition metav1.Condition) bool {
+	if status.Conditions == nil {
+		status.Conditions = []metav1.Condition{}
+	}
+
+	// Find existing condition
+	for i, condition := range status.Conditions {
+		if condition.Type == newCondition.Type {
+			// If status hasn't changed, preserve LastTransitionTime
+			if condition.Status == newCondition.Status {
+				newCondition.LastTransitionTime = condition.LastTransitionTime
+			}
+			// Check if anything actually changed
+			if condition.Status == newCondition.Status &&
+				condition.Reason == newCondition.Reason &&
+				condition.Message == newCondition.Message {
+				return false // No change needed
+			}
+			status.Conditions[i] = newCondition
+			return true
+		}
+	}
+
+	// Condition doesn't exist, add it
+	status.Conditions = append(status.Conditions, newCondition)
+	return true
 }
 
 // getTargetsToPatch determines which targets need patching based on secret changes
@@ -218,6 +378,28 @@ func (r *PatchTrackerReconciler) getTargetsToPatch(ctx context.Context, patchTra
 	// Iterate through targets list
 	for _, target := range patchTracker.Spec.Targets {
 		needsPatch := false
+
+		// Find the status for this specific target
+		var targetStatus *resourcepatchv1alpha1.TargetStatus
+		for i := range patchTracker.Status.Targets {
+			ts := &patchTracker.Status.Targets[i]
+			if ts.APIVersion == target.APIVersion &&
+				ts.Kind == target.Kind &&
+				ts.Name == target.Name &&
+				ts.Namespace == target.Namespace {
+				targetStatus = ts
+				break
+			}
+		}
+
+		// If no status exists for this target, it needs patching (first reconcile)
+		if targetStatus == nil {
+			logger.Info("No status found for target, needs initial patch",
+				"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name),
+				"kind", target.Kind)
+			targetsToPatch = append(targetsToPatch, target)
+			continue
+		}
 
 		// Iterate through secret dependencies of target
 		for _, secretDep := range target.SecretDeps {
@@ -254,13 +436,14 @@ func (r *PatchTrackerReconciler) getTargetsToPatch(ctx context.Context, patchTra
 					return nil, err
 				}
 
-				// Check if this secret version has changed
+				// Check if this secret version has changed for THIS target
 				secretKey := secretNamespace + "/" + secretName
 				currentVersion := secret.ResourceVersion
-				lastKnownVersion, exists := patchTracker.Status.SecretVersions[secretKey]
+				lastKnownVersion := targetStatus.SecretVersions[secretKey]
 
-				if !exists || lastKnownVersion != currentVersion {
-					logger.Info("Secret version changed, target needs patching",
+				if lastKnownVersion != currentVersion {
+					logger.Info("Secret version changed for target, needs patching",
+						"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name),
 						"secret", secretKey,
 						"currentVersion", currentVersion,
 						"lastKnownVersion", lastKnownVersion)
@@ -389,10 +572,11 @@ func (r *PatchTrackerReconciler) buildPatchValue(
 	}
 }
 
-// buildTimestampValue creates a timestamp annotation (legacy default behavior)
+// buildTimestampValue creates a timestamp annotation with nanosecond precision
+// to ensure unique values even when reconciles happen rapidly
 func (r *PatchTrackerReconciler) buildTimestampValue() interface{} {
 	return map[string]interface{}{
-		"resourcepatch.io/last-updated": time.Now().Format(time.RFC3339),
+		"resourcepatch.io/last-updated": time.Now().Format(time.RFC3339Nano),
 	}
 }
 

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,6 +37,12 @@ import (
 	resourcepatchv1alpha1 "github.com/k8soneill/resource-patch-operator/api/v1alpha1"
 )
 
+// uniqueSuffix generates a unique suffix for test resource names using nanosecond precision
+// to avoid name collisions in parallel test execution
+func uniqueSuffix() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
 // cleanupPatchTracker deletes a PatchTracker, reconciles to process finalizer removal,
 // and validates the object is fully deleted
 func cleanupPatchTracker(ctx context.Context, reconciler *PatchTrackerReconciler, k8sClient client.Client, key types.NamespacedName) {
@@ -42,11 +50,12 @@ func cleanupPatchTracker(ctx context.Context, reconciler *PatchTrackerReconciler
 	if err := k8sClient.Get(ctx, key, patchTracker); err == nil {
 		Expect(k8sClient.Delete(ctx, patchTracker)).To(Succeed())
 		// Reconcile to process finalizer removal
-		_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
-		// Validate the object is gone
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred(), "Reconcile should succeed during finalizer removal")
+		// Validate the object is gone by checking for IsNotFound error
 		Eventually(func() bool {
 			err := k8sClient.Get(ctx, key, patchTracker)
-			return err != nil
+			return apierrors.IsNotFound(err)
 		}, "10s", "500ms").Should(BeTrue(), "PatchTracker should be fully deleted after finalizer removal")
 	}
 }
@@ -68,9 +77,9 @@ var _ = Describe("PatchTracker Controller", func() {
 		BeforeEach(func() {
 			ctx = context.Background()
 			namespace = "default"
-			patchTrackerName = "test-patchtracker-" + time.Now().Format("150405")
-			secretName = "test-secret-" + time.Now().Format("150405")
-			deploymentName = "test-deployment-" + time.Now().Format("150405")
+			patchTrackerName = "test-patchtracker-" + uniqueSuffix()
+			secretName = "test-secret-" + uniqueSuffix()
+			deploymentName = "test-deployment-" + uniqueSuffix()
 
 			patchTrackerKey = types.NamespacedName{Name: patchTrackerName, Namespace: namespace}
 			secretKey = types.NamespacedName{Name: secretName, Namespace: namespace}
@@ -182,8 +191,11 @@ var _ = Describe("PatchTracker Controller", func() {
 				if err != nil {
 					return false
 				}
+				if len(patchTracker.Status.Targets) == 0 {
+					return false
+				}
 				secretVersionKey := namespace + "/" + secretName
-				_, exists := patchTracker.Status.SecretVersions[secretVersionKey]
+				_, exists := patchTracker.Status.Targets[0].SecretVersions[secretVersionKey]
 				return exists
 			}, "10s", "1s").Should(BeTrue())
 
@@ -211,8 +223,11 @@ var _ = Describe("PatchTracker Controller", func() {
 				if err != nil {
 					return false
 				}
+				if len(patchTracker.Status.Targets) == 0 {
+					return false
+				}
 				secretVersionKey := namespace + "/" + secretName
-				_, exists := patchTracker.Status.SecretVersions[secretVersionKey]
+				_, exists := patchTracker.Status.Targets[0].SecretVersions[secretVersionKey]
 				return exists
 			}, "10s", "1s").Should(BeTrue())
 
@@ -223,7 +238,6 @@ var _ = Describe("PatchTracker Controller", func() {
 			Expect(initialPatchTime).NotTo(BeEmpty())
 
 			By("Performing second reconcile without changing secret")
-			time.Sleep(2 * time.Second) // Ensure timestamp would differ if patched
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -245,8 +259,11 @@ var _ = Describe("PatchTracker Controller", func() {
 				if err != nil {
 					return false
 				}
+				if len(patchTracker.Status.Targets) == 0 {
+					return false
+				}
 				secretVersionKey := namespace + "/" + secretName
-				_, exists := patchTracker.Status.SecretVersions[secretVersionKey]
+				_, exists := patchTracker.Status.Targets[0].SecretVersions[secretVersionKey]
 				return exists
 			}, "10s", "1s").Should(BeTrue())
 
@@ -268,7 +285,6 @@ var _ = Describe("PatchTracker Controller", func() {
 			Expect(secret.ResourceVersion).NotTo(Equal(initialSecretVersion))
 
 			By("Performing second reconcile after secret update")
-			time.Sleep(2 * time.Second) // Ensure timestamp would differ
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -285,12 +301,13 @@ var _ = Describe("PatchTracker Controller", func() {
 			By("Verifying PatchTracker status has updated secret version")
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{}
 			Expect(k8sClient.Get(ctx, patchTrackerKey, patchTracker)).To(Succeed())
+			Expect(len(patchTracker.Status.Targets)).To(BeNumerically(">", 0))
 			secretVersionKey := namespace + "/" + secretName
-			Expect(patchTracker.Status.SecretVersions[secretVersionKey]).To(Equal(secret.ResourceVersion))
+			Expect(patchTracker.Status.Targets[0].SecretVersions[secretVersionKey]).To(Equal(secret.ResourceVersion))
 		})
 
 		It("should handle multiple secrets with different change states", func() {
-			secondSecretName := "test-secret-2-" + time.Now().Format("150405")
+			secondSecretName := "test-secret-2-" + uniqueSuffix()
 			secondSecretKey := types.NamespacedName{Name: secondSecretName, Namespace: namespace}
 
 			By("Creating a second secret")
@@ -333,7 +350,10 @@ var _ = Describe("PatchTracker Controller", func() {
 				if err != nil {
 					return 0
 				}
-				return len(patchTracker.Status.SecretVersions)
+				if len(patchTracker.Status.Targets) == 0 {
+					return 0
+				}
+				return len(patchTracker.Status.Targets[0].SecretVersions)
 			}, "10s", "1s").Should(Equal(2))
 
 			By("Getting initial patch time")
@@ -347,7 +367,6 @@ var _ = Describe("PatchTracker Controller", func() {
 			Expect(k8sClient.Update(ctx, secret2)).To(Succeed())
 
 			By("Reconciling after one secret changed")
-			time.Sleep(2 * time.Second)
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -377,8 +396,8 @@ var _ = Describe("PatchTracker Controller", func() {
 		BeforeEach(func() {
 			ctx = context.Background()
 			namespace = "default"
-			secretName = "test-secret-" + time.Now().Format("150405")
-			deploymentName = "test-deployment-" + time.Now().Format("150405")
+			secretName = "test-secret-" + uniqueSuffix()
+			deploymentName = "test-deployment-" + uniqueSuffix()
 
 			secretKey = types.NamespacedName{Name: secretName, Namespace: namespace}
 			deploymentKey = types.NamespacedName{Name: deploymentName, Namespace: namespace}
@@ -440,9 +459,10 @@ var _ = Describe("PatchTracker Controller", func() {
 
 		It("should patch with specific integer value", func() {
 			specificValue := int64(5)
-			rawValue, _ := json.Marshal(specificValue)
+			rawValue, marshalErr := json.Marshal(specificValue)
+			Expect(marshalErr).NotTo(HaveOccurred(), "json.Marshal should succeed for integer value")
 
-			patchTrackerName := "test-specific-int-" + time.Now().Format("150405")
+			patchTrackerName := "test-specific-int-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
@@ -500,9 +520,10 @@ var _ = Describe("PatchTracker Controller", func() {
 
 		It("should patch with specific string value", func() {
 			specificValue := "custom-annotation-value"
-			rawValue, _ := json.Marshal(specificValue)
+			rawValue, marshalErr := json.Marshal(specificValue)
+			Expect(marshalErr).NotTo(HaveOccurred(), "json.Marshal should succeed for string value")
 
-			patchTrackerName := "test-specific-string-" + time.Now().Format("150405")
+			patchTrackerName := "test-specific-string-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
@@ -559,9 +580,10 @@ var _ = Describe("PatchTracker Controller", func() {
 			// JSON unmarshaling produces float64 for numbers, but we normalize to int64
 			// when there's no fractional part (5.0 → 5)
 			specificValue := 3 // Will be marshaled to JSON as 3, unmarshaled as float64(3)
-			rawValue, _ := json.Marshal(specificValue)
+			rawValue, marshalErr := json.Marshal(specificValue)
+			Expect(marshalErr).NotTo(HaveOccurred(), "json.Marshal should succeed for numeric value")
 
-			patchTrackerName := "test-float-normalize-" + time.Now().Format("150405")
+			patchTrackerName := "test-float-normalize-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
@@ -618,7 +640,7 @@ var _ = Describe("PatchTracker Controller", func() {
 			Expect(os.Setenv("PATCH_RANDOM_SEED", "12345")).To(Succeed())
 			defer func() { _ = os.Unsetenv("PATCH_RANDOM_SEED") }()
 
-			patchTrackerName := "test-random-" + time.Now().Format("150405")
+			patchTrackerName := "test-random-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
@@ -701,7 +723,7 @@ var _ = Describe("PatchTracker Controller", func() {
 		})
 
 		It("should increment integer field", func() {
-			patchTrackerName := "test-increment-" + time.Now().Format("150405")
+			patchTrackerName := "test-increment-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
@@ -759,7 +781,7 @@ var _ = Describe("PatchTracker Controller", func() {
 		})
 
 		It("should handle missing field for increasingInteger (start from 0)", func() {
-			patchTrackerName := "test-increment-missing-" + time.Now().Format("150405")
+			patchTrackerName := "test-increment-missing-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
@@ -820,7 +842,7 @@ var _ = Describe("PatchTracker Controller", func() {
 			deployment.Annotations["bad-field"] = "not-a-number"
 			Expect(k8sClient.Update(ctx, deployment)).To(Succeed())
 
-			patchTrackerName := "test-increment-error-" + time.Now().Format("150405")
+			patchTrackerName := "test-increment-error-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
@@ -873,7 +895,7 @@ var _ = Describe("PatchTracker Controller", func() {
 		})
 
 		It("should validate specific method requires specificValue", func() {
-			patchTrackerName := "test-specific-missing-" + time.Now().Format("150405")
+			patchTrackerName := "test-specific-missing-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
@@ -923,7 +945,7 @@ var _ = Describe("PatchTracker Controller", func() {
 		})
 
 		It("should use default timestamp method when method field omitted", func() {
-			patchTrackerName := "test-default-timestamp-" + time.Now().Format("150405")
+			patchTrackerName := "test-default-timestamp-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
@@ -985,7 +1007,7 @@ var _ = Describe("PatchTracker Controller", func() {
 			deployment.Annotations["counter"] = "42"
 			Expect(k8sClient.Update(ctx, deployment)).To(Succeed())
 
-			patchTrackerName := "test-increment-string-" + time.Now().Format("150405")
+			patchTrackerName := "test-increment-string-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
@@ -1038,7 +1060,7 @@ var _ = Describe("PatchTracker Controller", func() {
 		})
 
 		It("should use custom random string length", func() {
-			patchTrackerName := "test-random-length-" + time.Now().Format("150405")
+			patchTrackerName := "test-random-length-" + uniqueSuffix()
 			patchTracker := &resourcepatchv1alpha1.PatchTracker{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      patchTrackerName,
