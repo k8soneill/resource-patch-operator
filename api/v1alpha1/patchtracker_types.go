@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -33,8 +34,10 @@ type PatchTrackerSpec struct {
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
 	// IgnoreMissingTarget controls whether a missing target resource is treated as an error.
-	// +default:value=true
-	IgnoreMissingTarget bool `json:"ignoreMissingTarget,omitempty"`
+	// When true, missing targets are skipped and will be patched when they appear.
+	// When false, missing targets cause an error to be recorded in status.
+	// +kubebuilder:default=true
+	IgnoreMissingTarget bool `json:"ignoreMissingTarget"`
 }
 
 // TargetRef identifies one or more Kubernetes objects to observe.
@@ -64,6 +67,22 @@ type PatchField struct {
 	// Path is the string path to the field to patch (e.g. "spec.replicas").
 	// +kubebuilder:validation:Required
 	Path string `json:"path"`
+
+	// Method determines how the patch value is generated.
+	// Allowed values: "timestamp", "specific", "randomString", "increasingInteger".
+	// +kubebuilder:validation:Enum=timestamp;specific;randomString;increasingInteger
+	// +kubebuilder:default="timestamp"
+	Method string `json:"method,omitempty"`
+
+	// SpecificValue is used when Method is "specific". Can be any JSON value.
+	// +optional
+	SpecificValue *apiextensionsv1.JSON `json:"specificValue,omitempty"`
+
+	// RandomStringLength specifies the length for randomString method.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=256
+	// +kubebuilder:default=32
+	RandomStringLength int `json:"randomStringLength,omitempty"`
 }
 
 // SecretRef identifies Secret dependencies which can trigger reconciles.
@@ -88,6 +107,29 @@ type ReconcileOptions struct {
 	Debounce *metav1.Duration `json:"debounce,omitempty"`
 }
 
+// TargetStatus tracks the state of a single target resource.
+type TargetStatus struct {
+	// Reference to the target resource
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Name       string `json:"name"`
+	Namespace  string `json:"namespace"`
+
+	// SecretVersions tracks the last successfully processed version of each secret for this target.
+	// Key: "namespace/secretname", Value: resourceVersion
+	SecretVersions map[string]string `json:"secretVersions,omitempty"`
+
+	// LastPatchTime is when this target was last successfully patched.
+	LastPatchTime *metav1.Time `json:"lastPatchTime,omitempty"`
+
+	// LastError contains the error message from the most recent patch attempt.
+	// Empty string indicates success.
+	LastError string `json:"lastError,omitempty"`
+
+	// LastErrorTime is when the last error occurred.
+	LastErrorTime *metav1.Time `json:"lastErrorTime,omitempty"`
+}
+
 // PatchTrackerStatus defines the observed state of PatchTracker.
 type PatchTrackerStatus struct {
 	// ObservedGeneration is the most recent generation observed by the controller.
@@ -99,25 +141,9 @@ type PatchTrackerStatus struct {
 	// LastReconcileTime is the time the controller last completed a reconcile.
 	LastReconcileTime *metav1.Time `json:"lastReconcileTime,omitempty"`
 
-	// TrackedResources lists resources that this PatchTracker is observing.
-	TrackedResources []TrackedResource `json:"trackedResources,omitempty"`
-
-	// LastPatchTime tracks when patches were last applied to targets
-	LastPatchTime *metav1.Time `json:"lastPatchTime,omitempty"`
-
-	// SecretVersions tracks the resourceVersion of each watched secret
-	// Key: "namespace/secretname", Value: resourceVersion
-	SecretVersions map[string]string `json:"secretVersions,omitempty"`
-}
-
-// TrackedResource records an observed resource and its last seen state.
-type TrackedResource struct {
-	APIVersion      string       `json:"apiVersion,omitempty"`
-	Kind            string       `json:"kind,omitempty"`
-	Name            string       `json:"name,omitempty"`
-	Namespace       string       `json:"namespace,omitempty"`
-	ResourceVersion string       `json:"resourceVersion,omitempty"`
-	LastSeen        *metav1.Time `json:"lastSeen,omitempty"`
+	// Targets tracks the status of each target independently.
+	// This provides per-target secret version tracking and error reporting.
+	Targets []TargetStatus `json:"targets,omitempty"`
 }
 
 // +kubebuilder:object:root=true
