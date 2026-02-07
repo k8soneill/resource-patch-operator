@@ -640,7 +640,8 @@ var _ = Describe("PatchTracker Controller", func() {
 			}, "10s", "1s").Should(Equal(int32(3)))
 		})
 
-		It("should generate random string with deterministic seed", func() {
+		// Serial execution required: This test uses process-global env var PATCH_RANDOM_SEED
+		It("should generate random string with deterministic seed", Serial, func() {
 			Expect(os.Setenv("PATCH_RANDOM_SEED", "12345")).To(Succeed())
 			defer func() { _ = os.Unsetenv("PATCH_RANDOM_SEED") }()
 

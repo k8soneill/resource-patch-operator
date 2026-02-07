@@ -401,7 +401,8 @@ func (r *PatchTrackerReconciler) setCondition(status *resourcepatchv1alpha1.Patc
 			// Check if anything actually changed
 			if condition.Status == newCondition.Status &&
 				condition.Reason == newCondition.Reason &&
-				condition.Message == newCondition.Message {
+				condition.Message == newCondition.Message &&
+				condition.ObservedGeneration == newCondition.ObservedGeneration {
 				return false // No change needed
 			}
 			status.Conditions[i] = newCondition
