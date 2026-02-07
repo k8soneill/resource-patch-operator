@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -42,6 +43,10 @@ import (
 
 	resourcepatchv1alpha1 "github.com/k8soneill/resource-patch-operator/api/v1alpha1"
 )
+
+// ErrTargetNotFound is returned when a target resource is not found but IgnoreMissingTarget is true.
+// This is a sentinel error used to distinguish "target doesn't exist yet" from "patch succeeded".
+var ErrTargetNotFound = errors.New("target resource not found")
 
 // PatchTrackerReconciler reconciles a PatchTracker object
 type PatchTrackerReconciler struct {
@@ -128,9 +133,16 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			results = append(results, targetResult{target: target, err: err})
 
 			if err != nil {
-				logger.Error(err, "Failed to apply patch to target",
-					"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name),
-					"kind", target.Kind)
+				// Don't log ErrTargetNotFound as an error - it's expected when IgnoreMissingTarget=true
+				if errors.Is(err, ErrTargetNotFound) {
+					logger.Info("Target not found, will retry when target is created",
+						"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name),
+						"kind", target.Kind)
+				} else {
+					logger.Error(err, "Failed to apply patch to target",
+						"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name),
+						"kind", target.Kind)
+				}
 				// Continue with other patches
 				continue
 			}
@@ -204,7 +216,22 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 
 		// Update the target status based on patch result
 		if result.err != nil {
-			// Patch failed - record error but don't update secret versions
+			// Check if this is the sentinel error for missing target
+			if errors.Is(result.err, ErrTargetNotFound) {
+				// Target doesn't exist yet - don't update secret versions or patch time
+				// This ensures we'll retry the patch when the target is created
+				logger.Info("Target not found, skipping status update to allow retry when target appears",
+					"target", fmt.Sprintf("%s/%s", target.Namespace, target.Name))
+				// Clear any previous error since this is expected behavior
+				if targetStatus.LastError != "" || targetStatus.LastErrorTime != nil {
+					targetStatus.LastError = ""
+					targetStatus.LastErrorTime = nil
+					updated = true
+				}
+				continue
+			}
+
+			// Other errors - record error but don't update secret versions
 			if targetStatus.LastError != result.err.Error() {
 				targetStatus.LastError = result.err.Error()
 				targetStatus.LastErrorTime = &now
@@ -531,7 +558,9 @@ func (r *PatchTrackerReconciler) applyPatchToTarget(ctx context.Context, patchTr
 			logger.Info("Target resource not found, ignoring due to IgnoreMissingTarget=true",
 				"name", target.Name,
 				"namespace", target.Namespace)
-			return nil
+			// Return sentinel error to indicate target doesn't exist yet
+			// This prevents updateTrackingStatus from recording this as a successful patch
+			return ErrTargetNotFound
 		}
 		return fmt.Errorf("failed to get target resource: %w", err)
 	}

@@ -41,8 +41,10 @@ spec:
             properties:
               ignoreMissingTarget:
                 default: true
-                description: IgnoreMissingTarget controls whether a missing target
-                  resource is treated as an error.
+                description: |-
+                  IgnoreMissingTarget controls whether a missing target resource is treated as an error.
+                  When true, missing targets are skipped and will be patched when they appear.
+                  When false, missing targets cause an error to be recorded in status.
                 type: boolean
               reconcile:
                 description: Reconcile controls when reconciles are triggered and
@@ -205,6 +207,7 @@ spec:
                   type: object
                 type: array
             required:
+            - ignoreMissingTarget
             - targets
             type: object
           status:

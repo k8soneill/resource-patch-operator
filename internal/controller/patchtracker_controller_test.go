@@ -1747,4 +1747,493 @@ var _ = Describe("PatchTracker Controller", func() {
 			Expect(patchTimes[1].Time).To(BeTemporally("<", patchTimes[2].Time))
 		})
 	})
+
+	Context("When handling missing targets with IgnoreMissingTarget", func() {
+		var (
+			ctx              context.Context
+			reconciler       *PatchTrackerReconciler
+			namespace        string
+			patchTrackerName string
+			secretName       string
+			deploymentName   string
+			patchTrackerKey  types.NamespacedName
+			secretKey        types.NamespacedName
+			deploymentKey    types.NamespacedName
+		)
+
+		BeforeEach(func() {
+			ctx = context.Background()
+			namespace = testNamespace
+			patchTrackerName = "test-ignore-missing-" + uniqueSuffix()
+			secretName = "test-secret-" + uniqueSuffix()
+			deploymentName = "test-deployment-" + uniqueSuffix()
+
+			patchTrackerKey = types.NamespacedName{Name: patchTrackerName, Namespace: namespace}
+			secretKey = types.NamespacedName{Name: secretName, Namespace: namespace}
+			deploymentKey = types.NamespacedName{Name: deploymentName, Namespace: namespace}
+
+			reconciler = &PatchTrackerReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			// Create test Secret
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      secretName,
+					Namespace: namespace,
+				},
+				Data: map[string][]byte{"key": []byte("value")},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			// Cleanup PatchTracker
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{}
+			if err := k8sClient.Get(ctx, patchTrackerKey, patchTracker); err == nil {
+				cleanupPatchTracker(ctx, reconciler, k8sClient, patchTrackerKey)
+			}
+
+			// Cleanup Deployment (may not exist in all tests)
+			deployment := &appsv1.Deployment{}
+			if err := k8sClient.Get(ctx, deploymentKey, deployment); err == nil {
+				Expect(k8sClient.Delete(ctx, deployment)).To(Succeed())
+			}
+
+			// Cleanup Secret
+			secret := &corev1.Secret{}
+			if err := k8sClient.Get(ctx, secretKey, secret); err == nil {
+				Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+			}
+		})
+
+		It("should not update SecretVersions when target missing and IgnoreMissingTarget=true", func() {
+			By("Creating PatchTracker with IgnoreMissingTarget=true and non-existent target")
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					IgnoreMissingTarget: true,
+					Targets: []resourcepatchv1alpha1.TargetRef{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "Deployment",
+							Name:       deploymentName, // Doesn't exist yet
+							Namespace:  namespace,
+							PatchField: resourcepatchv1alpha1.PatchField{
+								Path: "metadata.annotations",
+							},
+							PatchStrategy: "strategicMerge",
+							SecretDeps: []resourcepatchv1alpha1.SecretRef{
+								{
+									Name:      secretName,
+									Namespace: namespace,
+									Watch:     true,
+								},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling with missing target")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying status was created but SecretVersions is empty")
+			Eventually(func() bool {
+				patchTracker := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, patchTracker)
+				if err != nil {
+					return false
+				}
+				// Status should be created
+				return len(patchTracker.Status.Targets) > 0
+			}, "10s", "500ms").Should(BeTrue())
+
+			patchTracker = &resourcepatchv1alpha1.PatchTracker{}
+			Expect(k8sClient.Get(ctx, patchTrackerKey, patchTracker)).To(Succeed())
+			targetStatus := patchTracker.Status.Targets[0]
+
+			// SecretVersions should be empty (not updated)
+			secretVersionKey := namespace + "/" + secretName
+			_, exists := targetStatus.SecretVersions[secretVersionKey]
+			Expect(exists).To(BeFalse(), "SecretVersions should NOT be updated when target is missing")
+
+			// LastPatchTime should be nil (not updated)
+			Expect(targetStatus.LastPatchTime).To(BeNil(), "LastPatchTime should NOT be set when target is missing")
+
+			// No error should be recorded (this is expected behavior)
+			Expect(targetStatus.LastError).To(BeEmpty(), "LastError should be empty for missing target with IgnoreMissingTarget=true")
+			Expect(targetStatus.LastErrorTime).To(BeNil(), "LastErrorTime should be nil for missing target with IgnoreMissingTarget=true")
+		})
+
+		It("should patch target when created after initial reconcile with IgnoreMissingTarget=true", func() {
+			By("Creating PatchTracker with IgnoreMissingTarget=true and non-existent target")
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					IgnoreMissingTarget: true,
+					Targets: []resourcepatchv1alpha1.TargetRef{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "Deployment",
+							Name:       deploymentName,
+							Namespace:  namespace,
+							PatchField: resourcepatchv1alpha1.PatchField{
+								Path: "metadata.annotations",
+							},
+							PatchStrategy: "strategicMerge",
+							SecretDeps: []resourcepatchv1alpha1.SecretRef{
+								{
+									Name:      secretName,
+									Namespace: namespace,
+									Watch:     true,
+								},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling with missing target (first time)")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying SecretVersions not updated for missing target")
+			Eventually(func() bool {
+				patchTracker := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, patchTracker)
+				if err != nil || len(patchTracker.Status.Targets) == 0 {
+					return false
+				}
+				secretVersionKey := namespace + "/" + secretName
+				_, exists := patchTracker.Status.Targets[0].SecretVersions[secretVersionKey]
+				return !exists // Should NOT exist
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Creating the target deployment")
+			replicas := int32(1)
+			deployment := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      deploymentName,
+					Namespace: namespace,
+				},
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "test"},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{"app": "test"},
+						},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "test",
+									Image: "nginx:latest",
+								},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, deployment)).To(Succeed())
+
+			By("Reconciling again now that target exists")
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying deployment was patched")
+			Eventually(func() bool {
+				deployment := &appsv1.Deployment{}
+				err := k8sClient.Get(ctx, deploymentKey, deployment)
+				if err != nil {
+					return false
+				}
+				_, exists := deployment.Annotations["resourcepatch.io/last-updated"]
+				return exists
+			}, "10s", "500ms").Should(BeTrue(), "Deployment should be patched when it's created")
+
+			By("Verifying SecretVersions now updated")
+			Eventually(func() bool {
+				patchTracker := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, patchTracker)
+				if err != nil || len(patchTracker.Status.Targets) == 0 {
+					return false
+				}
+				secretVersionKey := namespace + "/" + secretName
+				_, exists := patchTracker.Status.Targets[0].SecretVersions[secretVersionKey]
+				return exists
+			}, "10s", "500ms").Should(BeTrue(), "SecretVersions should be updated after successful patch")
+
+			By("Verifying LastPatchTime is set")
+			patchTracker = &resourcepatchv1alpha1.PatchTracker{}
+			Expect(k8sClient.Get(ctx, patchTrackerKey, patchTracker)).To(Succeed())
+			Expect(patchTracker.Status.Targets[0].LastPatchTime).NotTo(BeNil(), "LastPatchTime should be set after successful patch")
+		})
+
+		It("should patch normally when target exists and IgnoreMissingTarget=true", func() {
+			By("Creating target deployment first")
+			replicas := int32(1)
+			deployment := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      deploymentName,
+					Namespace: namespace,
+				},
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "test"},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{"app": "test"},
+						},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "test",
+									Image: "nginx:latest",
+								},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, deployment)).To(Succeed())
+
+			By("Creating PatchTracker with IgnoreMissingTarget=true")
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					IgnoreMissingTarget: true,
+					Targets: []resourcepatchv1alpha1.TargetRef{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "Deployment",
+							Name:       deploymentName,
+							Namespace:  namespace,
+							PatchField: resourcepatchv1alpha1.PatchField{
+								Path: "metadata.annotations",
+							},
+							PatchStrategy: "strategicMerge",
+							SecretDeps: []resourcepatchv1alpha1.SecretRef{
+								{
+									Name:      secretName,
+									Namespace: namespace,
+									Watch:     true,
+								},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling with existing target")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying deployment was patched")
+			Eventually(func() bool {
+				deployment := &appsv1.Deployment{}
+				err := k8sClient.Get(ctx, deploymentKey, deployment)
+				if err != nil {
+					return false
+				}
+				_, exists := deployment.Annotations["resourcepatch.io/last-updated"]
+				return exists
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Verifying SecretVersions updated")
+			Eventually(func() bool {
+				patchTracker := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, patchTracker)
+				if err != nil || len(patchTracker.Status.Targets) == 0 {
+					return false
+				}
+				secretVersionKey := namespace + "/" + secretName
+				_, exists := patchTracker.Status.Targets[0].SecretVersions[secretVersionKey]
+				return exists
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Verifying LastPatchTime is set")
+			patchTracker = &resourcepatchv1alpha1.PatchTracker{}
+			Expect(k8sClient.Get(ctx, patchTrackerKey, patchTracker)).To(Succeed())
+			Expect(patchTracker.Status.Targets[0].LastPatchTime).NotTo(BeNil())
+			Expect(patchTracker.Status.Targets[0].LastError).To(BeEmpty())
+		})
+
+		It("should error when target missing and IgnoreMissingTarget=false", func() {
+			By("Creating PatchTracker with IgnoreMissingTarget=false and non-existent target")
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					IgnoreMissingTarget: false,
+					Targets: []resourcepatchv1alpha1.TargetRef{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "Deployment",
+							Name:       deploymentName, // Doesn't exist
+							Namespace:  namespace,
+							PatchField: resourcepatchv1alpha1.PatchField{
+								Path: "metadata.annotations",
+							},
+							PatchStrategy: "strategicMerge",
+							SecretDeps: []resourcepatchv1alpha1.SecretRef{
+								{
+									Name:      secretName,
+									Namespace: namespace,
+									Watch:     true,
+								},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling with missing target")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred()) // Controller logs error but doesn't return it
+
+			By("Verifying error status is recorded")
+			Eventually(func() bool {
+				patchTracker := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, patchTracker)
+				if err != nil || len(patchTracker.Status.Targets) == 0 {
+					return false
+				}
+				return patchTracker.Status.Targets[0].LastError != ""
+			}, "10s", "500ms").Should(BeTrue())
+
+			patchTracker = &resourcepatchv1alpha1.PatchTracker{}
+			Expect(k8sClient.Get(ctx, patchTrackerKey, patchTracker)).To(Succeed())
+			targetStatus := patchTracker.Status.Targets[0]
+
+			// Error should be recorded
+			Expect(targetStatus.LastError).To(ContainSubstring("not found"), "Error should mention resource not found")
+			Expect(targetStatus.LastErrorTime).NotTo(BeNil(), "LastErrorTime should be set")
+
+			// SecretVersions should NOT be updated (patch failed)
+			secretVersionKey := namespace + "/" + secretName
+			_, exists := targetStatus.SecretVersions[secretVersionKey]
+			Expect(exists).To(BeFalse(), "SecretVersions should NOT be updated when patch fails")
+
+			// LastPatchTime should be nil
+			Expect(targetStatus.LastPatchTime).To(BeNil(), "LastPatchTime should NOT be set when patch fails")
+		})
+
+		It("should patch normally when target exists and IgnoreMissingTarget=false", func() {
+			By("Creating target deployment first")
+			replicas := int32(1)
+			deployment := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      deploymentName,
+					Namespace: namespace,
+				},
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "test"},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{"app": "test"},
+						},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Name:  "test",
+									Image: "nginx:latest",
+								},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, deployment)).To(Succeed())
+
+			By("Creating PatchTracker with IgnoreMissingTarget=false")
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					IgnoreMissingTarget: false,
+					Targets: []resourcepatchv1alpha1.TargetRef{
+						{
+							APIVersion: "apps/v1",
+							Kind:       "Deployment",
+							Name:       deploymentName,
+							Namespace:  namespace,
+							PatchField: resourcepatchv1alpha1.PatchField{
+								Path: "metadata.annotations",
+							},
+							PatchStrategy: "strategicMerge",
+							SecretDeps: []resourcepatchv1alpha1.SecretRef{
+								{
+									Name:      secretName,
+									Namespace: namespace,
+									Watch:     true,
+								},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling with existing target")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying deployment was patched")
+			Eventually(func() bool {
+				deployment := &appsv1.Deployment{}
+				err := k8sClient.Get(ctx, deploymentKey, deployment)
+				if err != nil {
+					return false
+				}
+				_, exists := deployment.Annotations["resourcepatch.io/last-updated"]
+				return exists
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Verifying SecretVersions updated")
+			Eventually(func() bool {
+				patchTracker := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, patchTracker)
+				if err != nil || len(patchTracker.Status.Targets) == 0 {
+					return false
+				}
+				secretVersionKey := namespace + "/" + secretName
+				_, exists := patchTracker.Status.Targets[0].SecretVersions[secretVersionKey]
+				return exists
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Verifying LastPatchTime is set and no errors")
+			patchTracker = &resourcepatchv1alpha1.PatchTracker{}
+			Expect(k8sClient.Get(ctx, patchTrackerKey, patchTracker)).To(Succeed())
+			Expect(patchTracker.Status.Targets[0].LastPatchTime).NotTo(BeNil())
+			Expect(patchTracker.Status.Targets[0].LastError).To(BeEmpty())
+			Expect(patchTracker.Status.Targets[0].LastErrorTime).To(BeNil())
+		})
+	})
 })

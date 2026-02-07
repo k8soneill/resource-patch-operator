@@ -34,8 +34,10 @@ type PatchTrackerSpec struct {
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
 	// IgnoreMissingTarget controls whether a missing target resource is treated as an error.
-	// +default:value=true
-	IgnoreMissingTarget bool `json:"ignoreMissingTarget,omitempty"`
+	// When true, missing targets are skipped and will be patched when they appear.
+	// When false, missing targets cause an error to be recorded in status.
+	// +kubebuilder:default=true
+	IgnoreMissingTarget bool `json:"ignoreMissingTarget"`
 }
 
 // TargetRef identifies one or more Kubernetes objects to observe.
