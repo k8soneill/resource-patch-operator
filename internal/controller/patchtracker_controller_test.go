@@ -2237,4 +2237,581 @@ var _ = Describe("PatchTracker Controller", func() {
 			Expect(patchTracker.Status.Targets[0].LastErrorTime).To(BeNil())
 		})
 	})
+
+	Context("When using maintenance windows", func() {
+		var (
+			ctx              context.Context
+			reconciler       *PatchTrackerReconciler
+			namespace        string
+			patchTrackerName string
+			secretName       string
+			deploymentName   string
+			patchTrackerKey  types.NamespacedName
+			secretKey        types.NamespacedName
+			deploymentKey    types.NamespacedName
+		)
+
+		BeforeEach(func() {
+			ctx = context.Background()
+			namespace = testNamespace
+			patchTrackerName = "test-mw-" + uniqueSuffix()
+			secretName = "test-secret-" + uniqueSuffix()
+			deploymentName = "test-deployment-" + uniqueSuffix()
+
+			patchTrackerKey = types.NamespacedName{Name: patchTrackerName, Namespace: namespace}
+			secretKey = types.NamespacedName{Name: secretName, Namespace: namespace}
+			deploymentKey = types.NamespacedName{Name: deploymentName, Namespace: namespace}
+
+			reconciler = &PatchTrackerReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			// Create test Secret
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      secretName,
+					Namespace: namespace,
+				},
+				Data: map[string][]byte{"key": []byte("value")},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+
+			// Create test Deployment
+			replicas := int32(1)
+			deployment := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      deploymentName,
+					Namespace: namespace,
+				},
+				Spec: appsv1.DeploymentSpec{
+					Replicas: &replicas,
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "test"},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{"app": "test"},
+						},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Name:  "test",
+								Image: "nginx:latest",
+							}},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, deployment)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{}
+			if err := k8sClient.Get(ctx, patchTrackerKey, patchTracker); err == nil {
+				cleanupPatchTracker(ctx, reconciler, k8sClient, patchTrackerKey)
+			}
+
+			deployment := &appsv1.Deployment{}
+			if err := k8sClient.Get(ctx, deploymentKey, deployment); err == nil {
+				Expect(k8sClient.Delete(ctx, deployment)).To(Succeed())
+			}
+
+			secret := &corev1.Secret{}
+			if err := k8sClient.Get(ctx, secretKey, secret); err == nil {
+				Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+			}
+		})
+
+		It("should defer patches when before maintenance window start", func() {
+			By("Creating PatchTracker with maintenance window 1 hour in the future")
+			futureStart := metav1.NewTime(time.Now().Add(1 * time.Hour))
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					Targets: []resourcepatchv1alpha1.TargetRef{{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       deploymentName,
+						Namespace:  namespace,
+						PatchField: resourcepatchv1alpha1.PatchField{
+							Path: "metadata.annotations",
+						},
+						PatchStrategy: "strategicMerge",
+						SecretDeps: []resourcepatchv1alpha1.SecretRef{{
+							Name:      secretName,
+							Namespace: namespace,
+							Watch:     true,
+						}},
+					}},
+					Reconcile: resourcepatchv1alpha1.ReconcileOptions{
+						MaintenanceWindow: &resourcepatchv1alpha1.MaintenanceWindow{
+							Start:    futureStart,
+							Duration: &metav1.Duration{Duration: 2 * time.Hour},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling - patches should be deferred")
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying result has RequeueAfter set")
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0), "Should requeue for maintenance window")
+			Expect(result.RequeueAfter).To(BeNumerically("<=", 1*time.Hour), "RequeueAfter should be approximately time until window start")
+
+			By("Verifying deployment was NOT patched")
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, deploymentKey, deployment)).To(Succeed())
+			_, exists := deployment.Annotations["resourcepatch.io/last-updated"]
+			Expect(exists).To(BeFalse(), "Deployment should not be patched before maintenance window")
+
+			By("Verifying PatchesDeferred condition is set")
+			Eventually(func() bool {
+				pt := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, pt)
+				if err != nil {
+					return false
+				}
+				for _, c := range pt.Status.Conditions {
+					if c.Type == conditionPatchesDeferred && c.Status == metav1.ConditionTrue && c.Reason == "MaintenanceWindowNotActive" {
+						return true
+					}
+				}
+				return false
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Verifying PendingPatchCount is set")
+			pt := &resourcepatchv1alpha1.PatchTracker{}
+			Expect(k8sClient.Get(ctx, patchTrackerKey, pt)).To(Succeed())
+			Expect(pt.Status.PendingPatchCount).To(Equal(1))
+		})
+
+		It("should apply patches when inside maintenance window", func() {
+			By("Creating PatchTracker with maintenance window starting in the past")
+			pastStart := metav1.NewTime(time.Now().Add(-1 * time.Hour))
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					Targets: []resourcepatchv1alpha1.TargetRef{{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       deploymentName,
+						Namespace:  namespace,
+						PatchField: resourcepatchv1alpha1.PatchField{
+							Path: "metadata.annotations",
+						},
+						PatchStrategy: "strategicMerge",
+						SecretDeps: []resourcepatchv1alpha1.SecretRef{{
+							Name:      secretName,
+							Namespace: namespace,
+							Watch:     true,
+						}},
+					}},
+					Reconcile: resourcepatchv1alpha1.ReconcileOptions{
+						MaintenanceWindow: &resourcepatchv1alpha1.MaintenanceWindow{
+							Start:    pastStart,
+							Duration: &metav1.Duration{Duration: 2 * time.Hour},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling - patches should be applied")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying deployment was patched")
+			Eventually(func() bool {
+				deployment := &appsv1.Deployment{}
+				err := k8sClient.Get(ctx, deploymentKey, deployment)
+				if err != nil {
+					return false
+				}
+				_, exists := deployment.Annotations["resourcepatch.io/last-updated"]
+				return exists
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Verifying PendingPatchCount is 0")
+			pt := &resourcepatchv1alpha1.PatchTracker{}
+			Expect(k8sClient.Get(ctx, patchTrackerKey, pt)).To(Succeed())
+			Expect(pt.Status.PendingPatchCount).To(Equal(0))
+		})
+
+		It("should block patches when maintenance window has expired (strict)", func() {
+			By("Creating PatchTracker with expired maintenance window")
+			pastStart := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					Targets: []resourcepatchv1alpha1.TargetRef{{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       deploymentName,
+						Namespace:  namespace,
+						PatchField: resourcepatchv1alpha1.PatchField{
+							Path: "metadata.annotations",
+						},
+						PatchStrategy: "strategicMerge",
+						SecretDeps: []resourcepatchv1alpha1.SecretRef{{
+							Name:      secretName,
+							Namespace: namespace,
+							Watch:     true,
+						}},
+					}},
+					Reconcile: resourcepatchv1alpha1.ReconcileOptions{
+						MaintenanceWindow: &resourcepatchv1alpha1.MaintenanceWindow{
+							Start:    pastStart,
+							Duration: &metav1.Duration{Duration: 1 * time.Hour},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling - patches should be blocked")
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying no requeue (user must intervene)")
+			Expect(result.RequeueAfter).To(Equal(time.Duration(0)), "Should not requeue when window expired")
+
+			By("Verifying deployment was NOT patched")
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, deploymentKey, deployment)).To(Succeed())
+			_, exists := deployment.Annotations["resourcepatch.io/last-updated"]
+			Expect(exists).To(BeFalse(), "Deployment should not be patched when window expired")
+
+			By("Verifying PatchesDeferred condition shows expired")
+			Eventually(func() bool {
+				pt := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, pt)
+				if err != nil {
+					return false
+				}
+				for _, c := range pt.Status.Conditions {
+					if c.Type == conditionPatchesDeferred && c.Status == metav1.ConditionTrue && c.Reason == "MaintenanceWindowExpired" {
+						return true
+					}
+				}
+				return false
+			}, "10s", "500ms").Should(BeTrue())
+		})
+
+		It("should patch immediately when no maintenance window is set (backward compat)", func() {
+			By("Creating PatchTracker without maintenance window")
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					Targets: []resourcepatchv1alpha1.TargetRef{{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       deploymentName,
+						Namespace:  namespace,
+						PatchField: resourcepatchv1alpha1.PatchField{
+							Path: "metadata.annotations",
+						},
+						PatchStrategy: "strategicMerge",
+						SecretDeps: []resourcepatchv1alpha1.SecretRef{{
+							Name:      secretName,
+							Namespace: namespace,
+							Watch:     true,
+						}},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling - patches should be applied immediately")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying deployment was patched")
+			Eventually(func() bool {
+				deployment := &appsv1.Deployment{}
+				err := k8sClient.Get(ctx, deploymentKey, deployment)
+				if err != nil {
+					return false
+				}
+				_, exists := deployment.Annotations["resourcepatch.io/last-updated"]
+				return exists
+			}, "10s", "500ms").Should(BeTrue())
+		})
+
+		It("should patch when notBefore (no duration) is in the past", func() {
+			By("Creating PatchTracker with notBefore in the past (no duration)")
+			pastStart := metav1.NewTime(time.Now().Add(-1 * time.Hour))
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					Targets: []resourcepatchv1alpha1.TargetRef{{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       deploymentName,
+						Namespace:  namespace,
+						PatchField: resourcepatchv1alpha1.PatchField{
+							Path: "metadata.annotations",
+						},
+						PatchStrategy: "strategicMerge",
+						SecretDeps: []resourcepatchv1alpha1.SecretRef{{
+							Name:      secretName,
+							Namespace: namespace,
+							Watch:     true,
+						}},
+					}},
+					Reconcile: resourcepatchv1alpha1.ReconcileOptions{
+						MaintenanceWindow: &resourcepatchv1alpha1.MaintenanceWindow{
+							Start: pastStart,
+							// No Duration - pure notBefore
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling - patches should be applied")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying deployment was patched")
+			Eventually(func() bool {
+				deployment := &appsv1.Deployment{}
+				err := k8sClient.Get(ctx, deploymentKey, deployment)
+				if err != nil {
+					return false
+				}
+				_, exists := deployment.Annotations["resourcepatch.io/last-updated"]
+				return exists
+			}, "10s", "500ms").Should(BeTrue())
+		})
+
+		It("should defer when notBefore (no duration) is in the future", func() {
+			By("Creating PatchTracker with notBefore in the future (no duration)")
+			futureStart := metav1.NewTime(time.Now().Add(1 * time.Hour))
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					Targets: []resourcepatchv1alpha1.TargetRef{{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       deploymentName,
+						Namespace:  namespace,
+						PatchField: resourcepatchv1alpha1.PatchField{
+							Path: "metadata.annotations",
+						},
+						PatchStrategy: "strategicMerge",
+						SecretDeps: []resourcepatchv1alpha1.SecretRef{{
+							Name:      secretName,
+							Namespace: namespace,
+							Watch:     true,
+						}},
+					}},
+					Reconcile: resourcepatchv1alpha1.ReconcileOptions{
+						MaintenanceWindow: &resourcepatchv1alpha1.MaintenanceWindow{
+							Start: futureStart,
+							// No Duration - pure notBefore
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling - patches should be deferred")
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+			By("Verifying deployment was NOT patched")
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, deploymentKey, deployment)).To(Succeed())
+			_, exists := deployment.Annotations["resourcepatch.io/last-updated"]
+			Expect(exists).To(BeFalse())
+		})
+
+		It("should apply deferred patches when maintenance window opens", func() {
+			By("Creating PatchTracker with future maintenance window")
+			futureStart := metav1.NewTime(time.Now().Add(1 * time.Hour))
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					Targets: []resourcepatchv1alpha1.TargetRef{{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       deploymentName,
+						Namespace:  namespace,
+						PatchField: resourcepatchv1alpha1.PatchField{
+							Path: "metadata.annotations",
+						},
+						PatchStrategy: "strategicMerge",
+						SecretDeps: []resourcepatchv1alpha1.SecretRef{{
+							Name:      secretName,
+							Namespace: namespace,
+							Watch:     true,
+						}},
+					}},
+					Reconcile: resourcepatchv1alpha1.ReconcileOptions{
+						MaintenanceWindow: &resourcepatchv1alpha1.MaintenanceWindow{
+							Start:    futureStart,
+							Duration: &metav1.Duration{Duration: 2 * time.Hour},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling - patches should be deferred")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying SecretVersions are NOT updated (deferred)")
+			Eventually(func() bool {
+				pt := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, pt)
+				if err != nil {
+					return false
+				}
+				return pt.Status.PendingPatchCount == 1
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Moving maintenance window to current time (simulating window opening)")
+			pt := &resourcepatchv1alpha1.PatchTracker{}
+			Expect(k8sClient.Get(ctx, patchTrackerKey, pt)).To(Succeed())
+			pt.Spec.Reconcile.MaintenanceWindow.Start = metav1.NewTime(time.Now().Add(-1 * time.Hour))
+			Expect(k8sClient.Update(ctx, pt)).To(Succeed())
+
+			By("Reconciling again - patches should now be applied")
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying deployment was patched")
+			Eventually(func() bool {
+				deployment := &appsv1.Deployment{}
+				err := k8sClient.Get(ctx, deploymentKey, deployment)
+				if err != nil {
+					return false
+				}
+				_, exists := deployment.Annotations["resourcepatch.io/last-updated"]
+				return exists
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Verifying SecretVersions are now updated")
+			Eventually(func() bool {
+				pt := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, pt)
+				if err != nil || len(pt.Status.Targets) == 0 {
+					return false
+				}
+				secretVersionKey := namespace + "/" + secretName
+				_, exists := pt.Status.Targets[0].SecretVersions[secretVersionKey]
+				return exists
+			}, "10s", "500ms").Should(BeTrue())
+		})
+
+		It("should clear PatchesDeferred condition after patches are applied", func() {
+			By("Creating PatchTracker with future maintenance window")
+			futureStart := metav1.NewTime(time.Now().Add(1 * time.Hour))
+			patchTracker := &resourcepatchv1alpha1.PatchTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      patchTrackerName,
+					Namespace: namespace,
+				},
+				Spec: resourcepatchv1alpha1.PatchTrackerSpec{
+					Targets: []resourcepatchv1alpha1.TargetRef{{
+						APIVersion: "apps/v1",
+						Kind:       "Deployment",
+						Name:       deploymentName,
+						Namespace:  namespace,
+						PatchField: resourcepatchv1alpha1.PatchField{
+							Path: "metadata.annotations",
+						},
+						PatchStrategy: "strategicMerge",
+						SecretDeps: []resourcepatchv1alpha1.SecretRef{{
+							Name:      secretName,
+							Namespace: namespace,
+							Watch:     true,
+						}},
+					}},
+					Reconcile: resourcepatchv1alpha1.ReconcileOptions{
+						MaintenanceWindow: &resourcepatchv1alpha1.MaintenanceWindow{
+							Start:    futureStart,
+							Duration: &metav1.Duration{Duration: 2 * time.Hour},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, patchTracker)).To(Succeed())
+
+			By("Reconciling - patches should be deferred")
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying PatchesDeferred condition is True")
+			Eventually(func() bool {
+				pt := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, pt)
+				if err != nil {
+					return false
+				}
+				for _, c := range pt.Status.Conditions {
+					if c.Type == conditionPatchesDeferred && c.Status == metav1.ConditionTrue {
+						return true
+					}
+				}
+				return false
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Moving maintenance window to current time")
+			pt := &resourcepatchv1alpha1.PatchTracker{}
+			Expect(k8sClient.Get(ctx, patchTrackerKey, pt)).To(Succeed())
+			pt.Spec.Reconcile.MaintenanceWindow.Start = metav1.NewTime(time.Now().Add(-1 * time.Hour))
+			Expect(k8sClient.Update(ctx, pt)).To(Succeed())
+
+			By("Reconciling again - patches should now be applied")
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: patchTrackerKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying PatchesDeferred condition is now False")
+			Eventually(func() bool {
+				pt := &resourcepatchv1alpha1.PatchTracker{}
+				err := k8sClient.Get(ctx, patchTrackerKey, pt)
+				if err != nil {
+					return false
+				}
+				for _, c := range pt.Status.Conditions {
+					if c.Type == conditionPatchesDeferred && c.Status == metav1.ConditionFalse && c.Reason == "PatchesApplied" {
+						return true
+					}
+				}
+				return false
+			}, "10s", "500ms").Should(BeTrue())
+
+			By("Verifying PendingPatchCount is 0")
+			pt = &resourcepatchv1alpha1.PatchTracker{}
+			Expect(k8sClient.Get(ctx, patchTrackerKey, pt)).To(Succeed())
+			Expect(pt.Status.PendingPatchCount).To(Equal(0))
+		})
+	})
 })

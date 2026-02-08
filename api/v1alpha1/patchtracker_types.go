@@ -105,6 +105,22 @@ type ReconcileOptions struct {
 	RequeueAfter *metav1.Duration `json:"requeueAfter,omitempty"`
 	// Debounce coalesces rapid events occurring within this duration.
 	Debounce *metav1.Duration `json:"debounce,omitempty"`
+	// MaintenanceWindow restricts when patches can be applied.
+	// When set, detected secret changes are deferred until the window is active.
+	// +optional
+	MaintenanceWindow *MaintenanceWindow `json:"maintenanceWindow,omitempty"`
+}
+
+// MaintenanceWindow defines a time window during which patches are allowed.
+// Outside this window, detected changes are deferred until the window opens.
+type MaintenanceWindow struct {
+	// Start is the earliest time at which patches may be applied.
+	// +kubebuilder:validation:Required
+	Start metav1.Time `json:"start"`
+	// Duration is how long the window remains open after Start.
+	// If omitted, the window has no end (equivalent to a simple notBefore).
+	// +optional
+	Duration *metav1.Duration `json:"duration,omitempty"`
 }
 
 // TargetStatus tracks the state of a single target resource.
@@ -144,6 +160,11 @@ type PatchTrackerStatus struct {
 	// Targets tracks the status of each target independently.
 	// This provides per-target secret version tracking and error reporting.
 	Targets []TargetStatus `json:"targets,omitempty"`
+
+	// PendingPatchCount is the number of targets with detected changes
+	// that are deferred due to a maintenance window.
+	// +optional
+	PendingPatchCount int `json:"pendingPatchCount,omitempty"`
 }
 
 // +kubebuilder:object:root=true

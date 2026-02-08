@@ -54,6 +54,24 @@ spec:
                     description: Debounce coalesces rapid events occurring within
                       this duration.
                     type: string
+                  maintenanceWindow:
+                    description: |-
+                      MaintenanceWindow restricts when patches can be applied.
+                      When set, detected secret changes are deferred until the window is active.
+                    properties:
+                      duration:
+                        description: |-
+                          Duration is how long the window remains open after Start.
+                          If omitted, the window has no end (equivalent to a simple notBefore).
+                        type: string
+                      start:
+                        description: Start is the earliest time at which patches may
+                          be applied.
+                        format: date-time
+                        type: string
+                    required:
+                    - start
+                    type: object
                   requeueAfter:
                     description: RequeueAfter will requeue reconcile after the given
                       duration if set.
@@ -280,6 +298,11 @@ spec:
                 description: ObservedGeneration is the most recent generation observed
                   by the controller.
                 format: int64
+                type: integer
+              pendingPatchCount:
+                description: |-
+                  PendingPatchCount is the number of targets with detected changes
+                  that are deferred due to a maintenance window.
                 type: integer
               targets:
                 description: |-
