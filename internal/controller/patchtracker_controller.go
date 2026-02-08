@@ -48,6 +48,8 @@ import (
 // This is a sentinel error used to distinguish "target doesn't exist yet" from "patch succeeded".
 var ErrTargetNotFound = errors.New("target resource not found")
 
+const conditionPatchesDeferred = "PatchesDeferred"
+
 // PatchTrackerReconciler reconciles a PatchTracker object
 type PatchTrackerReconciler struct {
 	client.Client
@@ -122,6 +124,38 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if len(targetsToPatch) > 0 {
+		// Check maintenance window before applying patches
+		var window *resourcepatchv1alpha1.MaintenanceWindow
+		if patchTracker.Spec.Reconcile.MaintenanceWindow != nil {
+			window = patchTracker.Spec.Reconcile.MaintenanceWindow
+		}
+
+		allowed, expired, waitDuration := r.maintenanceWindowState(window)
+
+		if !allowed {
+			if expired {
+				logger.Info("Maintenance window has expired with pending patches",
+					"targetCount", len(targetsToPatch),
+					"windowStart", window.Start.Time)
+			} else {
+				logger.Info("Patches deferred due to maintenance window",
+					"targetCount", len(targetsToPatch),
+					"windowStart", window.Start.Time,
+					"requeueAfter", waitDuration)
+			}
+
+			if err := r.updateDeferredStatus(ctx, patchTracker, len(targetsToPatch), expired); err != nil {
+				logger.Error(err, "Failed to update deferred status")
+				return ctrl.Result{}, err
+			}
+
+			if expired {
+				// Strict: don't requeue, user must set a new window
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{RequeueAfter: waitDuration}, nil
+		}
+
 		logger.Info("Applying patches due to secret changes", "targetCount", len(targetsToPatch))
 
 		// Track results per target
@@ -162,6 +196,54 @@ func (r *PatchTrackerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// updateTargetSecretVersions updates the secret versions in the target status using the cache
+func (r *PatchTrackerReconciler) updateTargetSecretVersions(ctx context.Context, targetStatus *resourcepatchv1alpha1.TargetStatus, target resourcepatchv1alpha1.TargetRef, secretVersionCache map[string]string) error {
+	if targetStatus.SecretVersions == nil {
+		targetStatus.SecretVersions = make(map[string]string)
+	}
+
+	for _, secretDep := range target.SecretDeps {
+		if !secretDep.Watch {
+			continue
+		}
+
+		secretName := secretDep.Name
+		secretNamespace := secretDep.Namespace
+		if secretNamespace == "" {
+			secretNamespace = target.Namespace
+		}
+
+		secretKey := secretNamespace + "/" + secretName
+
+		// Try to get version from cache first
+		currentVersion, cached := secretVersionCache[secretKey]
+
+		if !cached {
+			// Fallback: fetch if not in cache (shouldn't happen in normal flow)
+			secretNamespacedName := types.NamespacedName{
+				Name:      secretName,
+				Namespace: secretNamespace,
+			}
+			secret := &corev1.Secret{}
+			if err := r.Get(ctx, secretNamespacedName, secret); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+				// Secret not found, skip version tracking
+				continue
+			}
+			currentVersion = secret.ResourceVersion
+			secretVersionCache[secretKey] = currentVersion
+		}
+
+		if targetStatus.SecretVersions[secretKey] != currentVersion {
+			targetStatus.SecretVersions[secretKey] = currentVersion
+		}
+	}
+
+	return nil
 }
 
 func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker, results []targetResult, secretVersionCache map[string]string) error {
@@ -242,47 +324,8 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 			}
 		} else {
 			// Patch succeeded - update secret versions and clear error
-			if targetStatus.SecretVersions == nil {
-				targetStatus.SecretVersions = make(map[string]string)
-			}
-
-			// Update secret versions for this target using cache
-			for _, secretDep := range target.SecretDeps {
-				if secretDep.Watch {
-					secretName := secretDep.Name
-					secretNamespace := secretDep.Namespace
-					if secretNamespace == "" {
-						secretNamespace = target.Namespace
-					}
-
-					secretKey := secretNamespace + "/" + secretName
-
-					// Try to get version from cache first
-					currentVersion, cached := secretVersionCache[secretKey]
-
-					if !cached {
-						// Fallback: fetch if not in cache (shouldn't happen in normal flow)
-						secretNamespacedName := types.NamespacedName{
-							Name:      secretName,
-							Namespace: secretNamespace,
-						}
-						secret := &corev1.Secret{}
-						if err := r.Get(ctx, secretNamespacedName, secret); err != nil {
-							if !apierrors.IsNotFound(err) {
-								return err
-							}
-							// Secret not found, skip version tracking
-							continue
-						}
-						currentVersion = secret.ResourceVersion
-						// Add to cache for potential reuse
-						secretVersionCache[secretKey] = currentVersion
-					}
-
-					if targetStatus.SecretVersions[secretKey] != currentVersion {
-						targetStatus.SecretVersions[secretKey] = currentVersion
-					}
-				}
+			if err := r.updateTargetSecretVersions(ctx, targetStatus, target, secretVersionCache); err != nil {
+				return err
 			}
 
 			// Always update LastPatchTime on successful patch
@@ -304,6 +347,23 @@ func (r *PatchTrackerReconciler) updateTrackingStatus(ctx context.Context, patch
 	// Update Ready condition based on target statuses
 	readyCondition := r.computeReadyCondition(statusPatch.Status.Targets, statusPatch.Generation)
 	if r.setCondition(&statusPatch.Status, readyCondition) {
+		updated = true
+	}
+
+	// Clear PatchesDeferred condition and PendingPatchCount after successful patching
+	deferredCondition := metav1.Condition{
+		Type:               conditionPatchesDeferred,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: statusPatch.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             "PatchesApplied",
+		Message:            "No patches are deferred",
+	}
+	if r.setCondition(&statusPatch.Status, deferredCondition) {
+		updated = true
+	}
+	if statusPatch.Status.PendingPatchCount != 0 {
+		statusPatch.Status.PendingPatchCount = 0
 		updated = true
 	}
 
@@ -840,6 +900,94 @@ func (r *PatchTrackerReconciler) applyServerSideApply(ctx context.Context, obj *
 
 	if err := r.Patch(ctx, patchObj, client.Apply, client.FieldOwner(fieldManager), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply server-side apply: %w", err)
+	}
+
+	return nil
+}
+
+// maintenanceWindowState evaluates the maintenance window and returns whether patches are allowed,
+// whether the window has expired, and how long to wait if patches are not yet allowed.
+func (r *PatchTrackerReconciler) maintenanceWindowState(window *resourcepatchv1alpha1.MaintenanceWindow) (allowed bool, expired bool, requeueAfter time.Duration) {
+	if window == nil {
+		return true, false, 0
+	}
+
+	now := time.Now()
+	start := window.Start.Time
+
+	// Before window opens
+	if now.Before(start) {
+		return false, false, start.Sub(now)
+	}
+
+	// Window has no duration (pure notBefore) — after start, always allowed
+	if window.Duration == nil {
+		return true, false, 0
+	}
+
+	// Check if within the window
+	end := start.Add(window.Duration.Duration)
+	if now.Before(end) {
+		return true, false, 0
+	}
+
+	// After window closed — strict enforcement: block patches
+	return false, true, 0
+}
+
+// updateDeferredStatus updates the PatchTracker status to reflect deferred patches
+func (r *PatchTrackerReconciler) updateDeferredStatus(ctx context.Context, patchTracker *resourcepatchv1alpha1.PatchTracker, pendingCount int, expired bool) error {
+	latest := &resourcepatchv1alpha1.PatchTracker{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(patchTracker), latest); err != nil {
+		return err
+	}
+
+	statusPatch := latest.DeepCopy()
+	updated := false
+
+	if statusPatch.Status.PendingPatchCount != pendingCount {
+		statusPatch.Status.PendingPatchCount = pendingCount
+		updated = true
+	}
+
+	if expired {
+		condition := metav1.Condition{
+			Type:               conditionPatchesDeferred,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: statusPatch.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "MaintenanceWindowExpired",
+			Message:            fmt.Sprintf("%d target(s) have pending patches but the maintenance window has expired", pendingCount),
+		}
+		if r.setCondition(&statusPatch.Status, condition) {
+			updated = true
+		}
+	} else {
+		condition := metav1.Condition{
+			Type:               conditionPatchesDeferred,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: statusPatch.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "MaintenanceWindowNotActive",
+			Message:            fmt.Sprintf("%d target(s) have pending patches deferred until maintenance window opens", pendingCount),
+		}
+		if r.setCondition(&statusPatch.Status, condition) {
+			updated = true
+		}
+	}
+
+	if statusPatch.Status.ObservedGeneration != statusPatch.Generation {
+		statusPatch.Status.ObservedGeneration = statusPatch.Generation
+		updated = true
+	}
+
+	if updated {
+		if err := r.Status().Update(ctx, statusPatch); err != nil {
+			if apierrors.IsConflict(err) {
+				return nil
+			}
+			return err
+		}
 	}
 
 	return nil
